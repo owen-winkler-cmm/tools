@@ -1,3 +1,4 @@
 .env
 .claude/standup-context.json
 /standup.md
+/standup.html

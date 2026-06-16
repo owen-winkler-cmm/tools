@@ -4,16 +4,16 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project purpose
 
-Personal EM toolbox: Claude Code slash commands backed by plain Node.js scripts. Currently contains one command (`/standup`) for running a daily kanban standup report against a Jira project.
+Personal EM toolbox: Claude Code slash commands for daily team operations and compliance workflows.
 
 ## Architecture
 
-Each slash command is a thin `.md` file that tells Claude to run a Node.js script. All logic lives in the script.
+Each slash command is a `.md` file in `.claude/commands/`. Commands that need data from external APIs use a backing Node.js script in `.claude/scripts/`; commands that drive Claude directly via MCP tools or the `gh` CLI need no script.
 
 ```
 .claude/
   commands/       # one .md file per slash command
-  scripts/        # one .js file per command
+  scripts/        # one .js file per script-backed commands
   standup-context.json   # gitignored; managed by Claude, not edited manually
 ```
 
@@ -45,6 +45,16 @@ Gitignored. Managed entirely by Claude -- never edit manually. Structure:
 ```
 
 Tell Claude in natural language to update it: "Rob is out next week", "remove Jeffrey from the ignore list", "Seyoung is back Thursday".
+
+## /emreview
+
+Performs an EM review of a GitHub pull request for SOX/ITGC compliance. Fetches PR metadata, commit history, review decisions, and the linked Jira ticket, then evaluates the 7 compliance criteria and produces a copyable PR comment.
+
+**Usage:** `/emreview <PR number>` (default repo: `covermymeds/drugs-api`)
+
+**Requires:** `gh` CLI authenticated + Atlassian Rovo MCP connected. No script -- runs entirely via `gh` and MCP tool calls.
+
+**Output:** A markdown table with ✅/❌/⚠️ per criterion, a plain-English change summary, and a APPROVED/NOT APPROVED/PENDING verdict.
 
 ## /standup
 

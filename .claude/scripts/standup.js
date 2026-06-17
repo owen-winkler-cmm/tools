@@ -48,6 +48,7 @@ const excludeTerms = [
     ? rawArgs[excludeFlagIdx + 1].split(',').map(s => normalizeN(s.trim())).filter(Boolean)
     : []),
 ];
+const skipGithub = rawArgs.includes('--skip-github');
 const isExcluded = name => excludeTerms.length > 0 && excludeTerms.some(t => normalizeN(name).includes(t));
 
 // Team membership: engineers active within this window are included even if idle now
@@ -119,6 +120,60 @@ async function searchAll(jql, fields, expand = null) {
     pageToken = d.nextPageToken;
   }
   return issues;
+}
+
+async function fetchRemoteLinks(issueKey) {
+  try {
+    const links = await jiraGet(`/rest/api/3/issue/${issueKey}/remotelink`);
+    return (Array.isArray(links) ? links : [])
+      .map(l => l.object?.url)
+      .filter(url => url && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPrActivity(prUrl) {
+  const match = prUrl.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+  if (!match) return null;
+  const [, repo, num] = match;
+  return new Promise(resolve => {
+    require('child_process').exec(
+      `gh pr view ${num} --repo ${repo} --json updatedAt,latestReviews,reviewRequests,comments,state,reviewDecision`,
+      { timeout: 15000 },
+      (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        try {
+          const d = JSON.parse(stdout);
+          const dates = [];
+          if (d.updatedAt) dates.push(new Date(d.updatedAt).getTime());
+          for (const r of (d.latestReviews || [])) {
+            if (r.submittedAt) dates.push(new Date(r.submittedAt).getTime());
+          }
+          for (const c of (d.comments || [])) {
+            if (c.createdAt) dates.push(new Date(c.createdAt).getTime());
+          }
+          resolve({
+            prUrl,
+            repo,
+            num: parseInt(num),
+            state: d.state,
+            reviewDecision: d.reviewDecision,
+            reviewers: (d.latestReviews || []).map(r => ({
+              author: r.author?.login, state: r.state, at: r.submittedAt,
+            })),
+            requestedReviewers: (d.reviewRequests || [])
+              .map(r => r.requestedReviewer?.login || r.requestedReviewer?.name)
+              .filter(Boolean),
+            lastActivity: dates.length ? new Date(Math.max(...dates)) : null,
+            commentCount: (d.comments || []).length,
+          });
+        } catch {
+          resolve(null);
+        }
+      },
+    );
+  });
 }
 
 function percentile(sorted, p) {
@@ -300,6 +355,24 @@ console.log = (...args) => { _origLog(...args); };
   rows = rows.filter(r => !isExcluded(r.name));
   for (const name of [...team.keys()]) if (isExcluded(name)) team.delete(name);
 
+  // Enrich In Review cards with GitHub PR activity (linked via Jira remote links)
+  if (!skipGithub) {
+    const reviewRows = rows.filter(r => /review/i.test(r.status));
+    if (reviewRows.length) {
+      const linkResults = await Promise.all(
+        reviewRows.map(r => fetchRemoteLinks(r.key).then(urls => ({ key: r.key, urls })))
+      );
+      await Promise.all(linkResults.map(async ({ key, urls }) => {
+        const row = rows.find(r => r.key === key);
+        if (!row) return;
+        row.prSearched = true;
+        if (!urls.length) { row.prActivity = null; return; }
+        row.prActivity = await fetchPrActivity(urls[0]);
+        if (row.prActivity) row.prUrl = urls[0];
+      }));
+    }
+  }
+
   // ── National Days ───────────────────────────────────────────────────────────
   const nationalDays = await fetchNationalDays();
   const todayDate = new Date(NOW);
@@ -430,11 +503,25 @@ console.log = (...args) => { _origLog(...args); };
       for (const r of cards) {
         const days = Math.floor(r.ms / 86400000);
         const over = days > sleDays;
+        let prHtml = '';
+        if (r.prSearched) {
+          if (!r.prActivity) {
+            prHtml = '<span class="pr-info pr-missing">no linked PR</span>';
+          } else {
+            const a = r.prActivity;
+            const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?';
+            const dec = (a.reviewDecision || 'pending').toLowerCase().replace(/[^a-z]/g, '-');
+            prHtml = '<a href="' + _esc(a.prUrl) + '" class="pr-info pr-link" target="_blank">PR #' + a.num + '</a>' +
+              '<span class="pr-info pr-decision pr-' + dec + '">' + _esc(a.reviewDecision || 'pending') + '</span>' +
+              '<span class="pr-info">' + _esc(lastAgo) + '</span>';
+          }
+        }
         cl += '<li>' +
           '<a href="' + BASE + '/browse/' + r.key + '" class="card-key" target="_blank">' + r.key + '</a>' +
           '<span class="card-title">' + _esc(trunc(r.summary, 70)) + '</span>' +
           '<span class="card-status">' + _esc(r.status) + '</span>' +
           '<span class="card-age' + (over ? ' over-sle' : '') + '">' + days + 'd' + (over ? ' ⚠' : '') + '</span>' +
+          prHtml +
           '</li>';
       }
       cl += '</ul>';
@@ -482,7 +569,7 @@ console.log = (...args) => { _origLog(...args); };
       ? '<ul class="av-list">' + avItems.map(i => '<li>' + i.html + '</li>').join('') + '</ul>'
       : '<p class="empty-note">No PTO or events in the next 30 days.</p>';
 
-    const css = '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}.wrap{max-width:960px;margin:0 auto;padding:32px 20px}header{margin-bottom:28px}h1{font-size:1.7rem;font-weight:700;color:#0f172a;letter-spacing:-.02em}.tagline{margin-top:6px;color:#64748b;font-size:.93rem}.tagline a{color:#3b82f6;text-decoration:none}.tagline a:hover{text-decoration:underline}.card{background:#fff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.07)}h2{font-size:1.05rem;font-weight:600;color:#0f172a;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #f1f5f9}.metrics-row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem;color:#475569}.metrics-row strong{color:#0f172a}.chart-wrap{margin-top:20px}.eng-block{padding:14px 0;border-bottom:1px solid #f1f5f9}.eng-block:last-child{border-bottom:none;padding-bottom:0}.eng-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}.eng-name{font-weight:600;color:#0f172a;font-size:.97rem}.eng-count{color:#64748b;font-size:.85rem}.wip-badge{padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600;text-decoration:none}.wip-badge.critical{background:#fee2e2;color:#991b1b}.wip-badge.concern{background:#fef3c7;color:#92400e}.pto-tag{background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600}.pto-tag.upcoming{background:#e0f2fe;color:#0369a1}.avail-note{color:#64748b;font-size:.88rem}a.card-key{font-weight:600;color:#3b82f6;text-decoration:none;white-space:nowrap;font-size:.85rem}a.card-key:hover{text-decoration:underline}.card-list{list-style:none;padding-left:4px}.card-list li{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:.88rem}.card-title{color:#374151}.card-status{font-weight:600;color:#0f172a;white-space:nowrap}.card-age{color:#64748b;white-space:nowrap}.card-age.over-sle{color:#ef4444;font-weight:700}.av-list{list-style:none}.av-list li{padding:7px 0;border-bottom:1px solid #f1f5f9;color:#374151;font-size:.9rem}.av-list li:last-child{border-bottom:none}.ev-note{color:#64748b;font-size:.85rem}.empty-note,.recs-placeholder{color:#94a3b8;font-style:italic;font-size:.9rem}#wip-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:300px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#wip-tip .tk{font-weight:700;font-size:13px}#wip-tip .td{margin-top:2px;color:#94a3b8;font-size:11px}#wip-tip .tl{margin-top:8px;pointer-events:auto}#wip-tip .tl a{color:#60a5fa;text-decoration:none;font-weight:600}#wip-tip .tl a:hover{text-decoration:underline}#recs-content h3{font-size:.97rem;font-weight:600;color:#0f172a;margin:20px 0 8px}#recs-content h3:first-child{margin-top:0}#recs-content p{margin-bottom:10px;color:#374151;font-size:.9rem}#recs-content ul,#recs-content ol{padding-left:20px;margin:0 0 14px;font-size:.9rem;color:#374151}#recs-content li{margin-bottom:6px;line-height:1.5}#recs-content a{color:#3b82f6;text-decoration:none}#recs-content a:hover{text-decoration:underline}';
+    const css = '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}.wrap{max-width:960px;margin:0 auto;padding:32px 20px}header{margin-bottom:28px}h1{font-size:1.7rem;font-weight:700;color:#0f172a;letter-spacing:-.02em}.tagline{margin-top:6px;color:#64748b;font-size:.93rem}.tagline a{color:#3b82f6;text-decoration:none}.tagline a:hover{text-decoration:underline}.card{background:#fff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.07)}h2{font-size:1.05rem;font-weight:600;color:#0f172a;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #f1f5f9}.metrics-row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem;color:#475569}.metrics-row strong{color:#0f172a}.chart-wrap{margin-top:20px}.eng-block{padding:14px 0;border-bottom:1px solid #f1f5f9}.eng-block:last-child{border-bottom:none;padding-bottom:0}.eng-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}.eng-name{font-weight:600;color:#0f172a;font-size:.97rem}.eng-count{color:#64748b;font-size:.85rem}.wip-badge{padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600;text-decoration:none}.wip-badge.critical{background:#fee2e2;color:#991b1b}.wip-badge.concern{background:#fef3c7;color:#92400e}.pto-tag{background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600}.pto-tag.upcoming{background:#e0f2fe;color:#0369a1}.avail-note{color:#64748b;font-size:.88rem}a.card-key{font-weight:600;color:#3b82f6;text-decoration:none;white-space:nowrap;font-size:.85rem}a.card-key:hover{text-decoration:underline}.card-list{list-style:none;padding-left:4px}.card-list li{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:.88rem}.card-title{color:#374151}.card-status{font-weight:600;color:#0f172a;white-space:nowrap}.card-age{color:#64748b;white-space:nowrap}.card-age.over-sle{color:#ef4444;font-weight:700}.av-list{list-style:none}.av-list li{padding:7px 0;border-bottom:1px solid #f1f5f9;color:#374151;font-size:.9rem}.av-list li:last-child{border-bottom:none}.ev-note{color:#64748b;font-size:.85rem}.empty-note,.recs-placeholder{color:#94a3b8;font-style:italic;font-size:.9rem}#wip-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:300px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#wip-tip .tk{font-weight:700;font-size:13px}#wip-tip .td{margin-top:2px;color:#94a3b8;font-size:11px}#wip-tip .tl{margin-top:8px;pointer-events:auto}#wip-tip .tl a{color:#60a5fa;text-decoration:none;font-weight:600}#wip-tip .tl a:hover{text-decoration:underline}#recs-content h3{font-size:.97rem;font-weight:600;color:#0f172a;margin:20px 0 8px}#recs-content h3:first-child{margin-top:0}#recs-content p{margin-bottom:10px;color:#374151;font-size:.9rem}#recs-content ul,#recs-content ol{padding-left:20px;margin:0 0 14px;font-size:.9rem;color:#374151}#recs-content li{margin-bottom:6px;line-height:1.5}#recs-content a{color:#3b82f6;text-decoration:none}#recs-content a:hover{text-decoration:underline}.pr-info{color:#94a3b8;font-size:.8rem}.pr-missing{color:#f97316}.pr-link{color:#60a5fa;text-decoration:none}.pr-link:hover{text-decoration:underline}.pr-approved{color:#22c55e;font-weight:600}.pr-changes-requested{color:#ef4444;font-weight:600}.pr-review-required{color:#f59e0b;font-weight:600}';
     const js = `const tip=document.getElementById("wip-tip");let pinned=false,pk=null;function showTip(el){const d=el.dataset;tip.innerHTML='<div class="tk">'+d.key+'</div><div class="td">'+d.summary+'</div><div class="td">'+d.name+' · '+d.days+'d · '+d.status+'</div><div class="tl"><a href="'+d.url+'" target="_blank">Open in Jira →</a></div>';tip.style.display='block';}tip.addEventListener('click',e=>e.stopPropagation());document.querySelectorAll('.wip-card').forEach(g=>{g.style.cursor='pointer';g.addEventListener('mouseenter',e=>{if(!pinned)showTip(e.currentTarget);});g.addEventListener('mousemove',e=>{if(!pinned){tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';}});g.addEventListener('mouseleave',()=>{if(!pinned)tip.style.display='none';});g.addEventListener('click',e=>{e.stopPropagation();const k=e.currentTarget.dataset.key;if(pinned&&pk===k){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}else{pinned=true;pk=k;showTip(e.currentTarget);tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';tip.style.pointerEvents='auto';}});});document.addEventListener('click',()=>{if(pinned){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});document.addEventListener('keydown',e=>{if(e.key==='Escape'){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});`;
 
     return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>' + _esc(PROJECT) + ' Standup — ' + _esc(dateLabel) + '</title>\n<style>' + css + '</style>\n</head>\n<body>\n<div class="wrap">\n' +
@@ -570,6 +657,20 @@ console.log = (...args) => { _origLog(...args); };
     for (const r of cards) {
       const link = `[${r.key}](${BASE}/browse/${r.key})`;
       console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}`);
+      if (r.prSearched) {
+        if (!r.prActivity) {
+          console.log(`  - GitHub: no linked PR found`);
+        } else {
+          const a = r.prActivity;
+          const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : 'unknown';
+          const reviewerStr = a.reviewers.length
+            ? a.reviewers.map(rv => `${rv.author} (${rv.state})`).join(', ')
+            : a.requestedReviewers.length
+              ? a.requestedReviewers.map(n => `${n} (requested)`).join(', ')
+              : 'none assigned';
+          console.log(`  - GitHub: [PR #${a.num}](${a.prUrl}) in ${a.repo} · ${a.state} · review: ${a.reviewDecision || 'NONE'} · last activity: ${lastAgo} · reviewers: ${reviewerStr}`);
+        }
+      }
     }
     console.log('');
   }

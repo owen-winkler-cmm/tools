@@ -69,3 +69,18 @@ Runs a PARCH kanban standup report (default project). Override with `--project K
 - Writes `standup.md` to the working directory on every run
 
 **PTO handling:** active PTO suppresses backlog suggestions; upcoming PTO (within 7 days) is flagged on the engineer's line.
+
+## /metadoc
+
+Produces canonical meta-documents: reference documents that define what must be true or what must exist within a documentation hierarchy. Does **not** produce the project documents that fulfill those requirements -- those live in project folios and reference back to the meta-document.
+
+**Usage:** `/metadoc [optional topic hint]`
+
+**Requires:** Atlassian Rovo MCP connected (for optional Confluence publishing). No script -- runs entirely via interactive interview and MCP.
+
+**What it produces:**
+- **Meta-documents**: canonical references stating requirements by phase, with a "what must exist" table naming subordinate meta-docs and project templates. Short by design -- if requirements exceed ~15 items, the skill splits off a subordinate rather than expanding.
+- **Subordinate meta-documents**: child documents that expand one complex requirement area from a parent meta-doc into its own structure. Published as Confluence children of their parent.
+- **Project templates** (optional): project-facing starters teams clone into their folio. Pre-populated with required sections and guidance notes; back-reference the meta-doc as the compliance standard.
+
+**Workflow:** Interactive interview → markdown draft for review → optional subordinate/template drafts → optional Confluence publish.

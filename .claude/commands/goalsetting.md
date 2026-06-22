@@ -186,6 +186,15 @@ it and require revision before proceeding:
 - **Baseline and metrics**: are the metrics grounded in current performance? Are there
   enough specifics to enable quarterly milestone tracking?
 
+**Goal type reclassification:** During review, a goal originally drafted as a development
+goal may turn out to be a performance goal (it describes an outcome the employee is
+accountable for delivering, not a skill or capability they are building). If this happens:
+- Reclassify it as a performance goal and count it toward the performance total
+- If the performance total is now at 4 (the maximum), note that explicitly
+- Prompt for a replacement development goal before proceeding to Phase 4 — do not leave
+  the development goal slot empty without asking. A well-considered development goal is
+  always worth finding; only skip it if the user explicitly declines after being asked.
+
 Do this for each goal individually. Do not batch goals for review. Only proceed to Phase 4
 once all goals are confirmed.
 

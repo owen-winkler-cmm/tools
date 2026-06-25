@@ -1,7 +1,8 @@
 <!-- EM review: SOX/ITGC compliance gate -- the final human sign-off before a change goes to production.
      This is NOT a code review. It checks process, traceability, segregation of duties, and testing evidence.
      Usage: /emreview <PR number or URL>
-     Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number". -->
+     Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number".
+     Version: 1.0 -->
 
 ## What an EM review is
 
@@ -34,6 +35,8 @@ gh api repos/<OWNER>/<REPO>/pulls/<NUMBER>/commits
 gh api repos/<OWNER>/<REPO>/contents/.github/CODEOWNERS --jq '.content' | base64 -d \
   || gh api repos/<OWNER>/<REPO>/contents/CODEOWNERS --jq '.content' | base64 -d
 ```
+
+Also scan the PR description for an **EM review checklist**: a block of markdown checkboxes (`- [ ]`/`- [x]`) under a heading or label that explicitly targets the EM (e.g. "EM Review", "EM Checklist", "For EM", "EM sign-off"). If found, extract each item and its checked/unchecked state. If no such block exists, note its absence — criterion 8 is simply omitted from the report.
 
 Extract any Jira ticket key(s) from the PR description. Match any `[A-Z]+-[0-9]+` pattern or Jira URL. Fetch each with the Atlassian Rovo MCP:
 - Tool: `getJiraIssue`, `cloudId`: `covermymeds.atlassian.net`
@@ -109,13 +112,17 @@ STCM flow:
 
 ---
 
-**5. Testing evidence valid** — Evidence demonstrates the specific change worked.
-- Evidence present (log output, screenshots, CI results)?
-  - Standard flow: evidence is in the PR description.
-  - STCM flow: evidence may be in the STCM ticket instead of the PR — check both.
-- Evidence shows the specific behavior described in the change (not just "app starts")?
-- For low-risk changes, CI green is sufficient. For medium/high, prefer screenshots or live-environment log output — note if CI-only evidence is present for a non-low-risk change.
-- Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed and tested independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
+**5. Testing evidence valid** — Evidence exists that the change was exercised and the acceptance criteria are met.
+
+Two modes, assessed differently:
+
+**CI-backed automated tests** (GitHub Actions or equivalent): No output in the PR is required — CI ran the suite and results are auditable there. The question is solely whether test coverage exists for the acceptance criteria. Coverage can be new tests added in this PR, or pre-existing tests that already cover the changed behavior (e.g., a library swap where existing unit tests exercise the same functionality). A bare pass count with no indication of AC coverage is thin — note it. A commit or diff showing new or existing tests that map to the AC is sufficient.
+
+**Manual or exploratory verification**: When the change cannot be fully verified by automated tests (UI behavior, external integrations, deployment steps, DB operations), a screenshot or log excerpt must appear in the PR body or comments showing the changed behavior worked.
+
+- Standard flow: look in the PR description and comments.
+- STCM flow: look in the STCM ticket as well — evidence may live there instead.
+- Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
 
 ---
 
@@ -142,6 +149,17 @@ STCM flow:
 
 ---
 
+**8. PR-specific requirements** *(only if an EM review checklist was found in the PR description)*
+
+These are loose, PR-author-defined checks -- not SOX criteria -- but they were explicitly surfaced for the EM, so all must be satisfied before approval.
+- A checklist item marked `[x]` is satisfied.
+- A checklist item marked `[ ]` is not. List unchecked items verbatim in the Notes column.
+- PASS if every item is checked.
+- ⚠️ NEEDS INFO if some items are unchecked.
+- If no EM review checklist was present in the PR, **omit this row entirely** from the table.
+
+---
+
 ### Part C: CODEOWNERS gate
 
 After assessing the 7 criteria, check whether all required CODEOWNERS approvals are in:
@@ -153,7 +171,7 @@ After assessing the 7 criteria, check whether all required CODEOWNERS approvals 
 ### Part D: Verdict
 
 One of three:
-- **APPROVED** — all 7 criteria pass
+- **APPROVED** — all applicable criteria pass (criteria 1–7 always; criterion 8 when present)
 - **NOT APPROVED** — one or more FAIL
 - **PENDING** — one or more NEEDS INFO, no FAILs
 
@@ -178,11 +196,14 @@ Produce this as a single markdown block, ready to paste as a GitHub PR comment:
 | 5 | Testing evidence valid | ✅/❌/⚠️ | |
 | 6 | Change history intact | ✅/❌/⚠️ | |
 | 7 | Production intent confirmed | ✅/❌/⚠️ | |
+| 8 | PR-specific requirements | ✅/❌/⚠️ | |
 
 **Verdict: APPROVED / NOT APPROVED / PENDING**
 ```
 
-Fill in the Notes column only for non-passing items — one clause is enough ("no ticket linked", "author approved own PR", "evidence predates last commit by 3 days"). Leave Notes blank for passing items to keep the table readable.
+Row 8 is included only when an EM review checklist was present in the PR description; omit it entirely otherwise.
+
+Fill in the Notes column for every row — one short clause stating what was found ("PARCH-824, In Review, done-when met", "ivan-tactukmercado-cmm approved", "last commit 18:35 UTC, approval 20:28 UTC"). For non-passing items, the note must name the specific gap. For passing items, the note is the evidence that earned the pass. Never leave Notes blank.
 
 If NOT APPROVED or PENDING, add a brief "**To reach approval:**" bullet list naming exactly what must change.
 

@@ -739,11 +739,13 @@ console.log = (...args) => { _origLog(...args); };
     }
   }
 
-  // ── Write standup.html ───────────────────────────────────────────────────────
-  const _fs = require('fs'), _path = require('path');
+  // ── Write standup HTML to a dated temp file ──────────────────────────────────
+  const _fs = require('fs'), _path = require('path'), _os = require('os');
   const medianDays = cycleTimes.length ? Math.round(percentile(cycleTimes, 0.5) / 86400000) : 0;
+  const _sDate = new Date().toISOString().slice(0, 10);
+  const _sOut = _path.join(_os.tmpdir(), `standup-${_sDate}.html`);
   _fs.writeFileSync(
-    _path.resolve(process.cwd(), 'standup.html'),
+    _sOut,
     generateStandupHtml({
       dateLabel: todayLabel,
       nationalDay: pickedNationalDay,
@@ -759,5 +761,11 @@ console.log = (...args) => { _origLog(...args); };
     }),
     'utf8',
   );
+  console.log('HTML_OUT:' + _sOut);
+  const { execSync: _execSync } = require('child_process');
+  try {
+    const _opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
+    _execSync(`${_opener} "${_sOut}"`);
+  } catch {}
 
 })().catch(e => { console.error(e.message); process.exit(1); });

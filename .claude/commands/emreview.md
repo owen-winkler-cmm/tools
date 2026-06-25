@@ -2,7 +2,7 @@
      This is NOT a code review. It checks process, traceability, segregation of duties, and testing evidence.
      Usage: /emreview <PR number or URL>
      Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number".
-     Version: 1.0 -->
+     Version: 1.1 -->
 
 ## What an EM review is
 
@@ -42,6 +42,9 @@ Extract any Jira ticket key(s) from the PR description. Match any `[A-Z]+-[0-9]+
 - Tool: `getJiraIssue`, `cloudId`: `covermymeds.atlassian.net`
 - `fields`: `["summary", "description", "status", "assignee", "comment"]`
 - `responseContentFormat`: `"markdown"`
+
+Also fetch issue links for each Jira ticket to check for open blockers or dependencies:
+- Tool: `getJiraIssueRemoteIssueLinks` is not sufficient — use `getJiraIssue` with `fields: ["issuelinks"]` in a second call, or include `"issuelinks"` in the fields list above. Look for any link where the relationship type is "is blocked by", "depends on", or equivalent, and the linked issue is not in a Done/Resolved/Closed status. If found, surface it in criterion 7.
 
 **Determine review flow** — two distinct paths, same 7 criteria, satisfied differently:
 
@@ -141,9 +144,19 @@ STCM flow:
 
 ---
 
-**7. Production intent confirmed** — PR is not a draft; no WIP/DO-NOT-MERGE markers.
-- PR not in draft state?
-- Title/description free of "WIP", "DO NOT MERGE", "draft"?
+**7. Production intent confirmed** — No affirmative signals indicate this change should be held.
+
+The default assumption is that the change is ready to deploy. This criterion only fails or needs info if something explicitly signals a hold. Scan the PR description, PR comments, and the linked Jira ticket for:
+
+- A deployment timing constraint ("deploy after hours", "coordinate with X team", "maintenance window required")
+- An unmet prerequisite ("blocked by PARCH-nnn", "waiting on config change in Y repo")
+- A stakeholder sign-off still pending ("needs product approval before shipping")
+- An open blocker or dependency link on the Jira ticket (a linked issue in Blocked By or Depends On status that is not yet resolved)
+
+If any of these are present: ⚠️ NEEDS INFO — surface what was found and let the EM decide.
+If none are found: ✅ PASS — note "no hold indicators found."
+
+Do not flag the absence of a deployment note as a problem. Absence of a hold signal is itself the signal.
 
 *(Same for both flows.)*
 

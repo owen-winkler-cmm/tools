@@ -2,7 +2,7 @@
      This is NOT a code review. It checks process, traceability, segregation of duties, and testing evidence.
      Usage: /emreview <PR number or URL>
      Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number".
-     Version: 1.1 -->
+     Version: 1.3 -->
 
 ## What an EM review is
 
@@ -117,7 +117,7 @@ STCM flow:
 
 **5. Testing evidence valid** — Evidence exists that the change was exercised and the acceptance criteria are met.
 
-Two modes, assessed differently:
+Three modes, assessed differently:
 
 **CI-backed automated tests** (GitHub Actions or equivalent): No output in the PR is required — CI ran the suite and results are auditable there. The question is solely whether test coverage exists for the acceptance criteria. Coverage can be new tests added in this PR, or pre-existing tests that already cover the changed behavior (e.g., a library swap where existing unit tests exercise the same functionality). A bare pass count with no indication of AC coverage is thin — note it. A commit or diff showing new or existing tests that map to the AC is sufficient.
 
@@ -126,6 +126,15 @@ Two modes, assessed differently:
 - Standard flow: look in the PR description and comments.
 - STCM flow: look in the STCM ticket as well — evidence may live there instead.
 - Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
+
+**Lower-environment prerequisite PR (merge-then-verify)**: Some repos use a workflow where a change must be deployed to a lower environment (e.g., unstable) before testing evidence can be captured — merging this PR IS the deployment step, so pre-merge evidence is structurally impossible. This applies when **both** of the following are true:
+
+1. The testing evidence comment or PR description explicitly states this PR is a lower-environment or non-production-facing step (e.g., "unstable only", "not production facing", "to gather testing evidence for the stable PR", or equivalent language).
+2. The production promotion that follows will go through its own separate EM review (with an STCM or its own PR review), at which point the testing evidence from this merged change will be required before that review can pass.
+
+In this case, criterion 5 **passes** — the merge-then-verify pattern is the established process for this repo, and the explicit acknowledgment in the testing evidence comment is sufficient. Note in the output that post-merge verification (e.g., ArgoCD green) is expected before the stable or production PR can advance.
+
+Currently known repos that use this pattern: `infrastructure/sharedtech-k8s`. Others may be added over time.
 
 ---
 
@@ -226,3 +235,19 @@ If APPROVED and the STCM is pending manager/EM approval, replace that line with:
 
 If APPROVED but CODEOWNERS-required approvals are still pending, add instead:
 "⚠️ SOX criteria met, but the following required CODEOWNERS approvals are still outstanding — PR is not mergeable until these are in: `<owner/team>` (for `<path pattern>`)"
+
+After all verdict text, always append a **Links** section listing every relevant URL gathered during the review. Include all of the following that are present:
+
+```
+---
+**Links**
+- [PR #<number> — <title>](<PR URL>)
+- [<TICKET-KEY> — <summary>](<Jira URL>)   ← work ticket (standard flow) or STCM (STCM flow); repeat for each ticket found
+- [STCM-<number> — <summary>](<Jira URL>)  ← if STCM flow; omit if same as above
+```
+
+Rules:
+- Always include the PR being reviewed.
+- Include every Jira ticket key extracted from the PR description (work tickets, STCM tickets, any other `[A-Z]+-[0-9]+` references).
+- Use the ticket summary as the link label (fetch it from Jira if not already retrieved).
+- Omit any URL you could not resolve. Do not fabricate URLs.

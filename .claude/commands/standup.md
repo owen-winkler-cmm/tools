@@ -18,7 +18,7 @@ Otherwise run:
 node .claude/scripts/standup.js $ARGUMENTS
 ```
 
-The script writes `standup.html` to the working directory and outputs a markdown data summary to stdout.
+The script writes the HTML report to a dated temp file, opens it in the default browser, and prints the exact output path to stdout on a line starting with `HTML_OUT:`. It also outputs a markdown data summary to stdout.
 
 Once you have the stdout output:
 
@@ -46,4 +46,4 @@ Recommendations must cover:
 
 Format recommendations as markdown. Use headers, bold text, and bullet lists -- no pipe tables. Every ticket reference must be a markdown link to its Jira card (https://covermymeds.atlassian.net/browse/ISSUE-nnn). Name engineers and tickets specifically, but frame actions as questions and suggestions, not orders. Prioritize by flow impact, not by age alone.
 
-After generating recommendations, inject them into `standup.html` by using the Edit tool to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.
+After generating recommendations, identify the output path from the `HTML_OUT:` line in stdout, then use the Edit tool on that file to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.

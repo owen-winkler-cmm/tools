@@ -62,7 +62,7 @@ async function fetchGroupOOO() {
     const { execSync } = require('child_process');
     const url = `https://graph.microsoft.com/v1.0/groups/${GROUP_ID}/calendar/events` +
       `?$filter=end/dateTime ge '${from}T00:00:00Z'&$select=subject,start,end,isAllDay&$top=100&$orderby=start/dateTime`;
-    const out = execSync(`az rest --method GET --url ${JSON.stringify(url)} 2>/dev/null`, { encoding: 'utf8', timeout: 12000 });
+    const out = execSync(`az rest --method GET --url ${JSON.stringify(url)}`, { encoding: 'utf8', timeout: 12000 });
     const data = JSON.parse(out);
     const entries = [];
     for (const ev of (data.value || [])) {
@@ -92,7 +92,20 @@ async function fetchGroupOOO() {
       }
     }
     return entries;
-  } catch {
+  } catch (err) {
+    // The OOO group calendar lives in the McKesson tenant. If the local az CLI
+    // session is logged into a different tenant (e.g. CoverMyMeds), the Graph
+    // call fails with ErrorInvalidGroup/ErrorAccessDenied rather than an auth
+    // error, since the group simply doesn't exist in the wrong tenant's
+    // directory. Surface that specific case on stdout so the orchestrating
+    // Claude session can prompt the user to re-login, instead of silently
+    // dropping calendar OOO with no explanation. Any other failure (az CLI
+    // not installed, network down, session fully expired) stays silent, same
+    // as before -- those aren't actionable mid-run.
+    const stderr = String(err.stderr || err.message || '');
+    if (/ErrorInvalidGroup|ErrorAccessDenied|AADSTS|invalid_grant/i.test(stderr)) {
+      console.log('\n**OOO calendar unavailable:** az CLI is logged into the wrong tenant for the GRP Dumpster Firefighters OOO group calendar (it lives in the McKesson tenant, not CoverMyMeds). Run `az login --tenant da67ef1b-ca59-4db2-9a8c-aa8d94617a16` and re-run this command to pick up calendar-based PTO/OOO.\n');
+    }
     return [];
   }
 }

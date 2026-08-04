@@ -23,6 +23,8 @@ node .claude/scripts/standup.js $ARGUMENTS
 
 The script writes the HTML report to a dated temp file, opens it in the default browser, and prints the exact output path to stdout on a line starting with `HTML_OUT:`. It also outputs a markdown data summary to stdout.
 
+**If stdout contains a line starting with `**OOO calendar unavailable:**`:** the az CLI session is logged into the wrong Azure tenant to read the OOO group calendar, so calendar-based PTO/OOO was silently skipped for this run. Use AskUserQuestion to ask whether to log into the correct tenant now (`az login --tenant da67ef1b-ca59-4db2-9a8c-aa8d94617a16`, which opens a browser auth flow) and re-run the standup, or continue without it. Don't run the login without asking first.
+
 Once you have the stdout output:
 
 1. Display the **Computed SLE** and **Team Status** sections verbatim, without any modification or commentary.
@@ -102,6 +104,16 @@ After injecting recommendations, use AskUserQuestion with:
 
 **This section runs when the CronCreate job fires.**
 
+<!-- The script paths below use the same repo-relative form as the initial run
+     instructions above (.claude/scripts/...), not an absolute path. They were
+     previously hardcoded to one contributor's local machine and synced-command
+     prefix (/Users/robert.little/.claude/scripts/owen-standup.js, and
+     /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js
+     pointing into that contributor's raw clone rather than the synced scripts
+     dir at all), which only happened to work by coincidence for that one
+     person and broke monitoring for every other teammate syncing this repo. -->
+
+
 1. Run `cat /tmp/standup-monitor-state.json`. If missing or empty, stop silently.
 2. Parse the state. If `Date.now()/1000 > expiresAt`:
    - Use CronDelete with the cronJobId.
@@ -111,7 +123,7 @@ After injecting recommendations, use AskUserQuestion with:
    - Stop.
 3. Run the standup script with `--skip-github --no-html` plus the stored cliArgs to get a fast Jira snapshot (the `--no-html` flag prevents overwriting the existing standup page):
    ```
-   node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github --no-html <cliArgs>
+   node .claude/scripts/standup.js --skip-github --no-html <cliArgs>
    ```
 4. Extract the Team Status section from stdout (same bounds as above).
 4.5. **Merged PR scan for "In Review" cards:** Even when Team Status looks unchanged, Jira lags behind GitHub merges. For each ticket `PARCH-NNN` that appears as "In Review" in `snapshotTeamStatus`, run:
@@ -121,7 +133,7 @@ After injecting recommendations, use AskUserQuestion with:
    If any PR has a `mergedAt` timestamp within the last 2 hours **and the key `PARCH-NNN#NUMBER` is not already in `knownMergedPRs` in the state file**, collect it as an extra change: `"PARCH-NNN: PR #NNN merged by AUTHOR — card still In Review, needs transition to Done"`. After surfacing a merged PR, add its key (`PARCH-NNN#NUMBER`) to `knownMergedPRs` in the state file so it is not reported again. If any new merged PRs are found, treat the run as "different" and include these entries in the changes array for step 6a (even if the Jira Team Status text is identical).
 5. **If identical to `snapshotTeamStatus` AND no merged PRs found in step 4.5:** update the last-checked timestamp only (no log entry):
    ```
-   node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
+   node .claude/scripts/update-live-standup.js \
      --live <htmlPath> --time <HH:MM> --no-changes
    ```
    Report "No changes at HH:MM." and stop.
@@ -129,12 +141,12 @@ After injecting recommendations, use AskUserQuestion with:
    a. Diff old (`snapshotTeamStatus`) vs. new Team Status line by line to build a plain-text change list. For each difference identify: status changes (`PARCH-NNN: Old → New`), cards added or removed, PR state changes. Merge in any merged-PR entries collected in step 4.5. Produce a JSON array of short strings, e.g. `["PARCH-786: In Review → Done","PARCH-999 added for Ivan","PARCH-786: PR #140 merged — card still In Review"]`.
    b. Run the full standup (with GitHub) in **draft mode** — writes a separate draft file without opening the browser:
       ```
-      node /Users/robert.little/.claude/scripts/owen-standup.js --draft <cliArgs>
+      node .claude/scripts/standup.js --draft <cliArgs>
       ```
       Get DRAFT_PATH from the `HTML_OUT:` line in stdout.
    c. Run the update helper to merge the draft into the live file. Pass the current time (`HH:MM`) and the JSON change array:
       ```
-      node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
+      node .claude/scripts/update-live-standup.js \
         --live <htmlPath from state file> \
         --draft <DRAFT_PATH> \
         --time <HH:MM> \

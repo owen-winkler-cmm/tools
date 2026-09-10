@@ -18,6 +18,196 @@ const ctx = (() => {
   try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}; } catch { return {}; }
 })();
 
+const rawArgs = process.argv.slice(2);
+
+// ── Escaping + card-linking helpers ───────────────────────────────────────────────────────
+// Used both by the aging-WIP chart/PR-preview HTML built during data collection below, and by
+// the static-report renderer that `--render` invokes afterward.
+function _esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+}
+function _escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Auto-linkifies any mention of a known Jira key or "PR #N" in free text against the
+// issues/prs pool from the data blob, so Recommendations prose gets the same linked,
+// hover-card-enabled treatment as Team Status without Claude hand-writing <a> tags.
+function cardLinks(rawText, issues, prs) {
+  const bolded = _esc(String(rawText ?? '')).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  const keys = Object.keys(issues);
+  const issueRe = keys.length ? new RegExp('\\b(' + keys.map(_escRe).join('|') + ')\\b', 'g') : null;
+  const prRe = /\bPR\s*#(\d+)\b/gi;
+  const matches = [];
+  if (issueRe) {
+    let m;
+    while ((m = issueRe.exec(bolded))) matches.push({ start: m.index, end: m.index + m[0].length, key: m[1], kind: 'issue' });
+  }
+  let pm;
+  while ((pm = prRe.exec(bolded))) {
+    if (prs[pm[1]]) matches.push({ start: pm.index, end: pm.index + pm[0].length, num: pm[1], text: pm[0], kind: 'pr' });
+  }
+  if (!matches.length) return bolded;
+  matches.sort((a, b) => a.start - b.start);
+  let out = '', cursor = 0;
+  for (const m of matches) {
+    if (m.start < cursor) continue;
+    out += bolded.slice(cursor, m.start);
+    out += m.kind === 'issue' ? issueAnchor(m.key, issues) : prAnchor(m.num, m.text, prs);
+    cursor = m.end;
+  }
+  out += bolded.slice(cursor);
+  return out;
+}
+function issueAnchor(key, issues) {
+  const d = issues[key];
+  if (!d) return _esc(key);
+  return '<a class="card-key tt" target="_blank" href="' + _esc(d.url) + '"' +
+    ' data-key="' + _esc(key) + '" data-title="' + _esc(key + ' — ' + d.title) + '"' +
+    ' data-summary="' + _esc(d.summary) + '" data-meta="' + _esc(d.meta) + '" data-url="' + _esc(d.url) + '">' +
+    _esc(key) + '</a>';
+}
+function prAnchor(num, text, prs) {
+  const d = prs[num];
+  if (!d) return _esc(text);
+  return '<a class="pr-info pr-link tt" target="_blank" href="' + _esc(d.url) + '"' +
+    ' data-key="pr-' + num + '" data-title="' + _esc(d.title) + '"' +
+    // d.summary is already-safe HTML (rendered from the PR body markdown) -- do not re-escape
+    ' data-summary="' + d.summary + '" data-meta="' + _esc(d.meta) + '" data-url="' + _esc(d.url) + '" data-link-label="Open PR">' +
+    _esc(text) + '</a>';
+}
+
+// ── Static report rendering ────────────────────────────────────────────────────────────────
+// Turns the completed data blob into one self-contained HTML file: no fetch, no CDN, no
+// polling -- safe to open via file://, email, or move anywhere.
+function renderHeaderHtml(data) {
+  let h = '<h1>' + _esc(data.projectName) + ' Standup — ' + _esc(data.dateLabel) + '</h1>';
+  if (data.nationalDay) {
+    h += '<p class="tagline">Today is: <a class="nd-label" href="' + _esc(data.nationalDay.url) +
+      '" target="_blank" data-desc="' + _esc(data.nationalDay.description || '') + '">' +
+      _esc(data.nationalDay.name) + '</a></p>';
+  }
+  return h;
+}
+function renderMetricsHtml(data) {
+  let h = '';
+  if (data.metrics) {
+    const m = data.metrics;
+    h += '<div class="metrics-row">' +
+      '<span><strong>85th Percentile (SLE):</strong> ' + _esc(m.sleLabel) + '</span>' +
+      '<span><strong>Median:</strong> ' + _esc(m.medianLabel) + '</span>' +
+      '<span><strong>Sample:</strong> ' + m.sampleCount + ' completed cards (last ' + m.historyDays + ' days)</span>' +
+      '<span><strong>Runway:</strong> ' + m.readyCardCount + ' ready card' + (m.readyCardCount === 1 ? '' : 's') +
+      (m.runwayWeeks ? ' (~' + m.runwayWeeks + 'w)' : '') + '</span></div>';
+  } else {
+    h += '<p class="empty-note">No completed cards with changelog data -- SLE unavailable.</p>';
+  }
+  return h + '<div class="chart-wrap">' + (data.chartSvg || '') + '</div>';
+}
+function renderTeamHtml(data) {
+  const issues = data.issues || {}, prs = data.prs || {};
+  let h = '';
+  for (const eng of (data.engineers || [])) {
+    h += '<div class="eng-block"><div class="eng-header">' +
+      '<span class="eng-name">' + _esc(eng.name) + '</span>' +
+      '<span class="eng-count">' + eng.count + ' card' + (eng.count === 1 ? '' : 's') + '</span>';
+    if (eng.badgeLevel) h += '<a href="#recommendations" class="wip-badge ' + eng.badgeLevel + '">⚠ WIP ' + _esc(eng.badgeLabel) + '</a>';
+    if (eng.pto) h += '<span class="pto-tag' + (eng.pto.partial ? ' partial' : '') + '">' + _esc(eng.pto.label) + '</span>';
+    h += '</div><ul class="card-list">';
+    for (const c of (eng.cards || [])) {
+      h += '<li>' + issueAnchor(c.key, issues) +
+        '<span class="card-title">' + _esc(c.titleShort) + '</span>' +
+        '<span class="card-status">' + _esc(c.status) + '</span>' +
+        '<span class="card-age' + (c.over ? ' over-sle' : '') + '">' + c.days + 'd' + (c.over ? ' ⚠' : '') + '</span>';
+      if (c.pr) {
+        if (c.pr.notNeeded) h += '<span class="pr-info pr-not-needed">no pr needed</span>';
+        if (c.pr.missing) h += '<span class="pr-info pr-missing">no linked PR</span>';
+        if (c.pr.active) {
+          h += cardLinks(c.pr.mention, issues, prs) +
+            '<span class="pr-info pr-decision pr-' + c.pr.decisionClass + '">' + _esc(c.pr.decision) + '</span>' +
+            '<span class="pr-info">' + _esc(c.pr.lastAgo) + '</span>';
+        }
+      }
+      h += '</li>';
+    }
+    h += '</ul></div>';
+  }
+  for (const av of (data.available || [])) {
+    h += '<div class="eng-block"><div class="eng-header"><span class="eng-name">' + _esc(av.name) + '</span>';
+    if (av.pto) {
+      h += '<span class="pto-tag' + (av.pto.kind === 'upcoming' ? ' upcoming' : '') + (av.pto.partial ? ' partial' : '') + '">' + _esc(av.pto.label) + '</span>';
+    } else if (av.suggestion) {
+      h += '<span class="avail-note">available → ' + issueAnchor(av.suggestion.key, issues) + ' ' + _esc(av.suggestion.summary) + ' <em>(' + _esc(av.suggestion.basis) + ')</em></span>';
+    } else {
+      h += '<span class="avail-note">available — <em>backlog exhausted</em></span>';
+    }
+    h += '</div></div>';
+  }
+  return h;
+}
+function renderRecommendationsHtml(data) {
+  const issues = data.issues || {}, prs = data.prs || {};
+  const recs = data.recommendations || [];
+  if (!recs.length) return '<p class="recs-placeholder">No recommendations generated.</p>';
+  let h = '';
+  for (const block of recs) {
+    if (block.type === 'heading') h += '<h3>' + cardLinks(block.text, issues, prs) + '</h3>';
+    else if (block.type === 'paragraph') h += '<p>' + cardLinks(block.text, issues, prs) + '</p>';
+    else if (block.type === 'list') h += '<ul>' + (block.items || []).map(i => '<li>' + cardLinks(i, issues, prs) + '</li>').join('') + '</ul>';
+    else if (block.type === 'placeholder') h += '<p class="recs-placeholder">' + _esc(block.text) + '</p>';
+  }
+  return h;
+}
+function renderAvailabilityHtml(data) {
+  const issues = data.issues || {}, prs = data.prs || {};
+  const items = data.availability || [];
+  if (!items.length) return '<p class="empty-note">No PTO or events in the next 30 days.</p>';
+  let h = '<ul class="av-list">';
+  for (const it of items) {
+    h += '<li>';
+    if (it.name) {
+      h += '<strong>' + _esc(it.name) + '</strong> — ' + cardLinks(it.label, issues, prs) + (it.note ? ' (' + _esc(it.note) + ')' : '');
+    } else {
+      h += _esc(it.dateLabel) + ' — ' + cardLinks(it.label, issues, prs) + (it.note ? ' <span class="ev-note">' + _esc(it.note) + '</span>' : '');
+    }
+    h += '</li>';
+  }
+  return h + '</ul>';
+}
+function renderStaticHtml(data) {
+  const fs = require('fs'), path = require('path');
+  let html = fs.readFileSync(path.resolve(__dirname, '../assets/standup/report.html'), 'utf8');
+  const tokens = {
+    '<!--TITLE-->': _esc(data.projectName + ' Standup — ' + data.dateLabel),
+    '<!--HEADER-->': renderHeaderHtml(data),
+    '<!--METRICS-->': renderMetricsHtml(data),
+    '<!--TEAM-->': renderTeamHtml(data),
+    '<!--RECOMMENDATIONS-->': renderRecommendationsHtml(data),
+    '<!--AVAILABILITY-->': renderAvailabilityHtml(data),
+  };
+  for (const [token, value] of Object.entries(tokens)) html = html.split(token).join(value);
+  return html;
+}
+
+// `--render <data.json>` turns a completed data blob (fetched + Claude-annotated with
+// recommendations and the national-day description) into the final static report and exits --
+// no Jira credentials or network access needed, so this runs before the BASE/EMAIL/TOKEN check.
+{
+  const renderFlagIdx = rawArgs.indexOf('--render');
+  if (renderFlagIdx !== -1) {
+    const fs = require('fs'), path = require('path'), os = require('os');
+    const dataPath = rawArgs[renderFlagIdx + 1];
+    if (!dataPath) { console.error('--render requires a path to a data JSON file (see DATA_OUT: from a prior run)'); process.exit(1); }
+    let data;
+    try { data = JSON.parse(fs.readFileSync(dataPath, 'utf8')); }
+    catch (e) { console.error('Could not read/parse ' + dataPath + ': ' + e.message); process.exit(1); }
+    const outPath = path.join(os.tmpdir(), `standup-${new Date().toISOString().slice(0, 10)}.html`);
+    fs.writeFileSync(outPath, renderStaticHtml(data), 'utf8');
+    console.log('REPORT_OUT:' + outPath);
+    const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    try { require('child_process').execSync(opener + ' ' + JSON.stringify(outPath)); } catch { /* non-fatal */ }
+    process.exit(0);
+  }
+}
+
 // Returns true when an In Review ticket with no linked PR is non-code work.
 // Description is checked first: any mention of a PR/pull request overrides classification.
 // Then checks issue type, built-in summary patterns, and ctx.noPrKeywords.
@@ -166,13 +356,17 @@ if (!BASE || !EMAIL || !TOKEN) {
 
 const AUTH = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString('base64')}`;
 
-const rawArgs = process.argv.slice(2);
 const normalizeN = s => s.toLowerCase().replace(/[^a-z ]/g, '').trim();
 
 const projectFlagIdx = rawArgs.indexOf('--project');
 const PROJECT = projectFlagIdx !== -1 && rawArgs[projectFlagIdx + 1]
   ? rawArgs[projectFlagIdx + 1].toUpperCase()
   : 'PARCH';
+
+const boardFlagIdx = rawArgs.indexOf('--board');
+const BOARD_ID = boardFlagIdx !== -1 && rawArgs[boardFlagIdx + 1]
+  ? parseInt(rawArgs[boardFlagIdx + 1], 10)
+  : 1967;
 
 const excludeFlagIdx = ['--exclude', '--ignore'].reduce((found, flag) => {
   const idx = rawArgs.indexOf(flag);
@@ -186,8 +380,6 @@ const excludeTerms = [
     : []),
 ];
 const skipGithub = rawArgs.includes('--skip-github');
-const noHtml = rawArgs.includes('--no-html');
-const draftMode = rawArgs.includes('--draft');
 const isExcluded = name => excludeTerms.length > 0 && excludeTerms.some(t => normalizeN(name).includes(t));
 
 // Team membership: engineers active within this window are included even if idle now
@@ -351,8 +543,12 @@ const SLE_BY_POINTS = { 1: 2, 2: 4, 3: 6, 5: 10, 8: 14, 13: 20, 20: 30, 21: 30 }
 const DEFAULT_SLE_DAYS = 12;
 const sleDays = pts => pts != null ? (SLE_BY_POINTS[pts] ?? DEFAULT_SLE_DAYS) : DEFAULT_SLE_DAYS;
 
-// Statuses misconfigured as "To Do" in Jira but treated as active work by this team
-const EXTRA_ACTIVE_STATUSES = ['Planned Ready'];
+// The board's "Planned/Ready" column (these statuses) sits in Jira's "To Do" category, but a
+// card there with an assignee is committed WIP -- Team Status treats those as in-flight. The
+// query pulls the whole column; the assignee condition is applied when building rows, so
+// unassigned Planned/Ready cards are dropped from Team Status but still count toward the
+// column's WIP limit.
+const EXTRA_ACTIVE_STATUSES = ['Planned Ready', 'Ready (migrated)'];
 const ACTIVE_STATUS_JQL = EXTRA_ACTIVE_STATUSES.length
   ? `(statusCategory = "In Progress" OR status in (${EXTRA_ACTIVE_STATUSES.map(s => `"${s}"`).join(',')}))`
   : `statusCategory = "In Progress"`;
@@ -519,7 +715,7 @@ console.log = (...args) => { _origLog(...args); };
 
 (async () => {
   // Fetch status category map and collaborators field in parallel with ticket queries
-  const [statusTypes, allFields, inFlight, completed, backlog] = await Promise.all([
+  const [statusTypes, allFields, inFlight, completed, backlog, boardConfig] = await Promise.all([
     jiraGet(`/rest/api/3/project/${PROJECT}/statuses`),
     jiraGet('/rest/api/3/field'),
     searchAll(
@@ -533,11 +729,12 @@ console.log = (...args) => { _origLog(...args); };
       'assignee,statuscategorychangedate,components',
       'changelog',
     ),
-    // Backlog cards available to pull, oldest first
+    // Pullable ready queue: unassigned "Selected for Development" cards, oldest first
     searchAll(
-      `project = ${PROJECT} AND issuetype != Epic AND status = "Selected For Development" AND assignee is EMPTY ORDER BY created ASC`,
+      `project = ${PROJECT} AND issuetype != Epic AND status = "Selected for Development" AND assignee is EMPTY ORDER BY created ASC`,
       `summary,description,components,priority,${STORY_POINTS_FIELD}`,
     ),
+    jiraGet(`/rest/agile/1.0/board/${BOARD_ID}/configuration`).catch(() => null),
   ]);
 
   const collabFieldId = allFields.find(f => f.name === 'Collaborators')?.id ?? null;
@@ -563,6 +760,26 @@ console.log = (...args) => { _origLog(...args); };
   for (const issueType of statusTypes) {
     for (const status of issueType.statuses) {
       categoryByStatus.set(status.name, status.statusCategory.key);
+    }
+  }
+
+  const statusNameById = new Map();
+  for (const issueType of statusTypes) {
+    for (const s of issueType.statuses) statusNameById.set(String(s.id), s.name);
+  }
+
+  // statusToColumn: Jira status name → board column name
+  // columnLimits: board column name → max WIP (0 = hard zero — any card here is a violation)
+  const statusToColumn = new Map();
+  const columnLimits = new Map();
+  if (boardConfig?.columnConfig?.columns) {
+    for (const col of boardConfig.columnConfig.columns) {
+      if (col.max != null) columnLimits.set(col.name, col.max);
+      for (const st of (col.statuses || [])) {
+        const id = String(st.id ?? (st.self || '').match(/\/(\d+)$/)?.[1] ?? '');
+        const name = statusNameById.get(id);
+        if (name) statusToColumn.set(name, col.name);
+      }
     }
   }
 
@@ -608,10 +825,10 @@ console.log = (...args) => { _origLog(...args); };
   const computedSleMsRaw = percentile(cycleTimes, SLE_PERCENTILE);
   const computedSleMs = computedSleMsRaw ?? DEFAULT_SLE_DAYS * 86400000;
 
-  // Backlog runway: ready cards at commitment point vs. throughput
-  const plannedReadyCount = inFlight.filter(i => EXTRA_ACTIVE_STATUSES.includes(i.fields.status.name)).length;
+  // Backlog runway: pullable ready cards (unassigned "Selected for Development") vs. throughput
+  const readyCardCount = backlog.length;
   const throughputPerWeek = activeCompleted.length / (SLE_HISTORY_DAYS / 7);
-  const runwayWeeks = throughputPerWeek > 0 ? Math.round((plannedReadyCount / throughputPerWeek) * 10) / 10 : null;
+  const runwayWeeks = throughputPerWeek > 0 ? Math.round((readyCardCount / throughputPerWeek) * 10) / 10 : null;
 
   // Build team: in-flight assignees + anyone who resolved a ticket in the last 14 days
   const team = new Map();
@@ -625,8 +842,15 @@ console.log = (...args) => { _origLog(...args); };
     }
   }
 
+  // Team Status in-flight = In Progress category + Planned/Ready cards that have an owner.
+  // Unassigned Planned/Ready cards are queued, not in-flight; they're dropped here but still
+  // counted toward their column's WIP limit below.
+  const inFlightAssigned = inFlight.filter(
+    issue => !EXTRA_ACTIVE_STATUSES.includes(issue.fields.status.name) || issue.fields.assignee,
+  );
+
   // Build in-flight rows
-  let rows = inFlight.map(issue => {
+  let rows = inFlightAssigned.map(issue => {
     const pts = issue.fields[STORY_POINTS_FIELD] ?? null;
     const entryTime = EXTRA_ACTIVE_STATUSES.includes(issue.fields.status.name)
       ? getStatusEntryTime(issue)
@@ -655,6 +879,20 @@ console.log = (...args) => { _origLog(...args); };
   rows.sort((a, b) => b.ms - a.ms);
   rows = rows.filter(r => !isExcluded(r.name));
   for (const name of [...team.keys()]) if (isExcluded(name)) team.delete(name);
+
+  // WIP counts include every card physically in each active column -- including unassigned
+  // Planned/Ready cards -- minus omitted engineers, so the Planned/Ready limit still bites.
+  const columnCardCounts = new Map();
+  for (const issue of inFlight) {
+    if (isExcluded(issue.fields.assignee?.displayName ?? '')) continue;
+    const col = statusToColumn.get(issue.fields.status.name) ?? issue.fields.status.name;
+    columnCardCounts.set(col, (columnCardCounts.get(col) ?? 0) + 1);
+  }
+  const violatedColumns = new Set(
+    [...columnLimits.entries()]
+      .filter(([name, limit]) => (columnCardCounts.get(name) ?? 0) > limit)
+      .map(([name]) => name),
+  );
 
   // Enrich In Review cards with GitHub PR activity (linked via Jira remote links)
   if (!skipGithub) {
@@ -709,7 +947,7 @@ console.log = (...args) => { _origLog(...args); };
     console.log(`**85th percentile (SLE):** ${humanDuration(computedSleMs)}  `);
     console.log(`**Median:** ${humanDuration(median)}  `);
     console.log(`**Sample:** ${cycleTimes.length} completed cards (last ${SLE_HISTORY_DAYS} days)  `);
-    console.log(`**Backlog Runway:** ${plannedReadyCount} ready card${plannedReadyCount !== 1 ? 's' : ''}${runwayWeeks !== null ? ` (~${runwayWeeks}w at current throughput)` : ''}  `);
+    console.log(`**Backlog Runway:** ${readyCardCount} ready card${readyCardCount !== 1 ? 's' : ''}${runwayWeeks !== null ? ` (~${runwayWeeks}w at current throughput)` : ''}  `);
   } else {
     console.log(`_No completed cards with changelog data in the last ${SLE_HISTORY_DAYS} days -- SLE unavailable._`);
   }
@@ -722,8 +960,6 @@ console.log = (...args) => { _origLog(...args); };
     if (EXTRA_ACTIVE_STATUSES.some(es => es.toLowerCase() === s)) return 3;
     return 2;
   }
-
-  const _esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
 
   // Minimal, safe markdown -> HTML for PR body previews in tooltips. Escapes first (so any
   // literal HTML in the PR description can't inject markup), then layers on headers, **bold**,
@@ -740,7 +976,7 @@ console.log = (...args) => { _origLog(...args); };
     return esc.split(/\n+/).map(l => l.trim()).filter(Boolean).join('<br>');
   }
 
-  function generateAgingWipSvg(inFlightRows, sleDays) {
+  function generateAgingWipSvg(inFlightRows, sleDays, issueStore) {
     if (!inFlightRows.length) return '<p><em>No in-flight cards.</em></p>';
     const W = 820, H = 400, P = {t:30, r:95, b:72, l:50};
     const pw = W - P.l - P.r, ph = H - P.t - P.b;
@@ -778,7 +1014,14 @@ console.log = (...args) => { _origLog(...args); };
     for (let i = 0; i < nc; i++) {
       const cx = (P.l + i * cw + cw / 2).toFixed(1);
       e.push('<text x="' + cx + '" y="' + (P.t+ph+20).toFixed(1) + '" text-anchor="middle" fill="#374151" font-size="12" font-weight="500" font-family="system-ui,sans-serif">' + _esc(stages[i].name) + '</text>');
-      e.push('<text x="' + cx + '" y="' + (P.t+ph+36).toFixed(1) + '" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="system-ui,sans-serif">WIP: ' + stages[i].cards.length + '</text>');
+      const wipCol = statusToColumn.get(stages[i].name) ?? stages[i].name;
+      const wipLimit = columnLimits.get(wipCol);
+      // A hard-zero limit (e.g. In Review) is always "full" by design -- treat it like no
+      // limit at all here so the chart reports a plain count instead of a false alarm.
+      const hasLimit = wipLimit != null && wipLimit > 0;
+      const wipOver = hasLimit && (columnCardCounts.get(wipCol) ?? 0) > wipLimit;
+      const wipLabel = hasLimit ? 'WIP: ' + stages[i].cards.length + '/' + wipLimit : 'WIP: ' + stages[i].cards.length;
+      e.push('<text x="' + cx + '" y="' + (P.t+ph+36).toFixed(1) + '" text-anchor="middle" fill="' + (wipOver ? '#ef4444' : '#94a3b8') + '" font-size="11" font-weight="' + (wipOver ? '700' : '400') + '" font-family="system-ui,sans-serif">' + wipLabel + '</text>');
     }
     e.push('<line x1="' + P.l + '" y1="' + P.t + '" x2="' + P.l + '" y2="' + (P.t+ph) + '" stroke="#cbd5e1" stroke-width="1"/>');
     e.push('<line x1="' + P.l + '" y1="' + (P.t+ph) + '" x2="' + (P.l+pw) + '" y2="' + (P.t+ph) + '" stroke="#cbd5e1" stroke-width="1"/>');
@@ -796,11 +1039,13 @@ console.log = (...args) => { _origLog(...args); };
         const pct = sleDays > 0 ? days / sleDays : 0;
         const col = pct > 1.0 ? {f:'#ef4444',s:'#b91c1c'} : pct > 0.75 ? {f:'#f97316',s:'#ea580c'} : pct > 0.5 ? {f:'#eab308',s:'#ca8a04'} : {f:'#22c55e',s:'#16a34a'};
         const num = r.key.replace(/[^-]+-/, '');
-        const url = BASE + '/browse/' + r.key;
-        const cardSummary = adfToText(r.descriptionText, 300) || r.summary;
+        const d = issueStore[r.key];
+        const url = d ? d.url : BASE + '/browse/' + r.key;
+        const cardTitle = d ? (r.key + ' — ' + d.title) : (r.key + ' — ' + trunc(r.summary, 60));
+        const cardSummary = d ? d.summary : (adfToText(r.descriptionText, 300) || r.summary);
         e.push(
           '<a href="' + url + '" target="_blank" style="text-decoration:none">' +
-          '<g class="wip-card" data-key="' + r.key + '" data-url="' + url + '" data-title="' + _esc(r.key + ' — ' + trunc(r.summary, 60)) + '" data-summary="' + _esc(cardSummary) + '" data-name="' + _esc(r.name) + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
+          '<g class="wip-card" data-key="' + r.key + '" data-url="' + url + '" data-title="' + _esc(cardTitle) + '" data-summary="' + _esc(cardSummary) + '" data-name="' + _esc(r.name) + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
           '<circle cx="' + cx + '" cy="' + cy + '" r="13" fill="' + col.f + '" stroke="' + col.s + '" stroke-width="1.5"/>' +
           '<text x="' + cx + '" y="' + cy + '" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="9" font-weight="600" font-family="system-ui,sans-serif" style="pointer-events:none">' + num + '</text>' +
           '</g></a>'
@@ -810,135 +1055,145 @@ console.log = (...args) => { _origLog(...args); };
     return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;max-width:' + W + 'px;height:auto;display:block">\n' + e.join('\n') + '\n</svg>';
   }
 
-  function generateStandupHtml({ dateLabel, nationalDay, sleDays, medianDays, sampleCount, plannedReadyCount, runwayWeeks, rows, engineerEntries, available, availSuggestions }) {
-    const ndUrl = nationalDay ? nationalDay.dayUrl : null;
-    const svg = generateAgingWipSvg(rows, sleDays);
+  // Builds the plain, JSON-serializable data blob that `--render` turns into the final static
+  // report. Claude fills in Recommendations / the national-day description by editing plain
+  // JSON fields between the fetch step and the render step, rather than hand-splicing values
+  // into HTML (the source of the unescaped-quote/dropped-`>` bug class).
+  function buildReportData({ dateLabel, nationalDay, sleDays, sleLabel, medianLabel, sampleCount, readyCardCount, runwayWeeks, rows, engineerEntries, available, availSuggestions }) {
+    // Centralized issue/PR data pool: the single source of truth for every card and PR
+    // mentioned anywhere in the report. Team Status, the WIP chart, and available-suggestion
+    // links all read from it below, and it ships as-is in the JSON so the client-side
+    // cardLinks Handlebars helper can turn any text mention of a known key -- e.g. in
+    // Recommendations -- into the same linked, hover-card-enabled reference.
+    const issues = {};
+    for (const r of rows) {
+      const days = Math.floor(r.ms / 86400000);
+      issues[r.key] = {
+        title: trunc(r.summary, 70),
+        summary: adfToText(r.descriptionText, 300) || r.summary,
+        url: BASE + '/browse/' + r.key,
+        meta: r.status + ' · ' + days + 'd',
+      };
+    }
+    for (const sug of availSuggestions.values()) {
+      if (!sug || issues[sug.card.key]) continue;
+      const c = sug.card;
+      const status = c.fields.status?.name ?? '';
+      issues[c.key] = {
+        title: trunc(c.fields.summary, 70),
+        summary: adfToText(c.fields.description ? JSON.stringify(c.fields.description) : '', 300) || c.fields.summary,
+        url: BASE + '/browse/' + c.key,
+        meta: status,
+      };
+    }
+    const prs = {};
+    for (const r of rows) {
+      if (!r.prActivity) continue;
+      const a = r.prActivity;
+      const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?';
+      const prReviewerStr = a.reviewers.length
+        ? a.reviewers.map(rv => `${rv.author} (${rv.state})`).join(', ')
+        : a.requestedReviewers.length
+          ? a.requestedReviewers.map(n => `${n} (requested)`).join(', ')
+          : 'none assigned';
+      const prBodyTrunc = a.body ? (a.body.length > 300 ? a.body.slice(0, 300) + '…' : a.body) : '';
+      prs[String(a.num)] = {
+        title: 'PR #' + a.num + ' · ' + a.repo,
+        summary: prBodyTrunc ? mdToHtml(prBodyTrunc) : 'No description provided.',
+        meta: (a.reviewDecision || 'pending') + ' · ' + lastAgo + ' · reviewers: ' + prReviewerStr,
+        url: a.prUrl,
+      };
+    }
 
-    let teamHtml = '';
-    for (const [name, cards] of engineerEntries) {
-      const count = cards.length;
-      const badge = count >= 3
-        ? '<a href="#recommendations" class="wip-badge critical">⚠ WIP Critical</a>'
-        : count >= 2 ? '<a href="#recommendations" class="wip-badge concern">⚠ WIP Concern</a>' : '';
+    const chartSvg = generateAgingWipSvg(rows, sleDays, issues);
+
+    const engineers = engineerEntries.map(([name, cards]) => {
+      // Cards sitting in a review-named status are done and waiting on someone else -- they
+      // don't compete for the engineer's attention the way active work does, so only
+      // actively-worked cards count toward the WIP concern/critical badge.
+      const activeCount = cards.filter(r => !/review/i.test(r.status)).length;
+      const badgeLevel = activeCount >= 3 ? 'critical' : activeCount >= 2 ? 'concern' : null;
       const ptoEntry = getActivePto(name);
       const upcoming = !ptoEntry ? getUpcomingPto(name) : [];
-      const ptoTag = ptoEntry
-        ? '<span class="pto-tag' + (ptoEntry.allDay === false ? ' partial' : '') + '">' + _esc(ptoActiveLabel(ptoEntry)) + '</span>'
-        : upcoming.length
-          ? '<span class="pto-tag upcoming">' + _esc(ptoUpcomingLabel(upcoming[0])) + '</span>'
-          : '';
-      let cl = '<ul class="card-list">';
-      for (const r of cards) {
-        const days = Math.floor(r.ms / 86400000);
-        const over = days > sleDays;
-        let prHtml = '';
-        if (!r.prSearched && looksLikeNoPr(r)) {
-          prHtml = '<span class="pr-info pr-not-needed">no pr needed</span>';
-        } else if (r.prSearched) {
-          if (!r.prActivity) {
-            prHtml = (looksLikeNoPr(r) || r.aiNoPr)
-              ? '<span class="pr-info pr-not-needed">no pr needed</span>'
-              : '<span class="pr-info pr-missing">no linked PR</span>';
-          } else {
-            const a = r.prActivity;
-            const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?';
-            const dec = (a.reviewDecision || 'pending').toLowerCase().replace(/[^a-z]/g, '-');
-            const prReviewerStr = a.reviewers.length
-              ? a.reviewers.map(rv => `${rv.author} (${rv.state})`).join(', ')
-              : a.requestedReviewers.length
-                ? a.requestedReviewers.map(n => `${n} (requested)`).join(', ')
-                : 'none assigned';
-            const prBodyTrunc = a.body ? (a.body.length > 300 ? a.body.slice(0, 300) + '…' : a.body) : '';
-            const prSummary = prBodyTrunc ? mdToHtml(prBodyTrunc) : 'No description provided.';
-            prHtml = '<a href="' + _esc(a.prUrl) + '" class="pr-info pr-link tt"' +
-              ' data-key="pr-' + a.num + '" data-title="' + _esc('PR #' + a.num + ' · ' + a.repo) + '"' +
-              // prSummary is already-safe HTML from mdToHtml (or a plain literal) -- do not re-escape
-              ' data-summary="' + prSummary + '"' +
-              ' data-meta="' + _esc((a.reviewDecision || 'pending') + ' · ' + lastAgo + ' · reviewers: ' + prReviewerStr) + '"' +
-              ' data-url="' + _esc(a.prUrl) + '" data-link-label="Open PR" target="_blank">PR #' + a.num + '</a>' +
-              '<span class="pr-info pr-decision pr-' + dec + '">' + _esc(a.reviewDecision || 'pending') + '</span>' +
-              '<span class="pr-info">' + _esc(lastAgo) + '</span>';
+      const pto = ptoEntry
+        ? { label: ptoActiveLabel(ptoEntry), partial: ptoEntry.allDay === false }
+        : upcoming.length ? { label: ptoUpcomingLabel(upcoming[0]), kind: 'upcoming' } : null;
+
+      return {
+        name,
+        count: cards.length,
+        badgeLevel,
+        badgeLabel: badgeLevel === 'critical' ? 'Critical' : badgeLevel === 'concern' ? 'Concern' : null,
+        pto,
+        cards: cards.map(r => {
+          const days = Math.floor(r.ms / 86400000);
+          let pr = null;
+          if (!r.prSearched && looksLikeNoPr(r)) {
+            pr = { notNeeded: true };
+          } else if (r.prSearched) {
+            if (!r.prActivity) {
+              pr = (looksLikeNoPr(r) || r.aiNoPr) ? { notNeeded: true } : { missing: true };
+            } else {
+              const a = r.prActivity;
+              pr = {
+                active: true,
+                mention: 'PR #' + a.num,
+                decision: a.reviewDecision || 'pending',
+                decisionClass: (a.reviewDecision || 'pending').toLowerCase().replace(/[^a-z]/g, '-'),
+                lastAgo: a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?',
+              };
+            }
           }
-        }
-        const ticketSummary = adfToText(r.descriptionText, 300) || r.summary;
-        cl += '<li>' +
-          '<a href="' + BASE + '/browse/' + r.key + '" class="card-key tt"' +
-          ' data-key="' + _esc(r.key) + '" data-title="' + _esc(r.key + ' — ' + trunc(r.summary, 60)) + '" data-summary="' + _esc(ticketSummary) + '"' +
-          ' data-meta="' + _esc(r.status + ' · ' + days + 'd') + '"' +
-          ' data-url="' + BASE + '/browse/' + r.key + '" target="_blank">' + r.key + '</a>' +
-          '<span class="card-title">' + _esc(trunc(r.summary, 70)) + '</span>' +
-          '<span class="card-status">' + _esc(r.status) + '</span>' +
-          '<span class="card-age' + (over ? ' over-sle' : '') + '">' + days + 'd' + (over ? ' ⚠' : '') + '</span>' +
-          prHtml +
-          '</li>';
-      }
-      cl += '</ul>';
-      teamHtml += '<div class="eng-block"><div class="eng-header">' +
-        '<span class="eng-name">' + _esc(name) + '</span>' +
-        '<span class="eng-count">' + count + ' card' + (count !== 1 ? 's' : '') + '</span>' +
-        badge + ptoTag +
-        '</div>' + cl + '</div>';
-    }
-    for (const name of available) {
+          return { key: r.key, titleShort: trunc(r.summary, 70), status: r.status, days, over: days > sleDays, pr };
+        }),
+      };
+    });
+
+    const availableList = available.map(name => {
       const ptoEntry = getActivePto(name);
-      if (ptoEntry) {
-        teamHtml += '<div class="eng-block"><div class="eng-header">' +
-          '<span class="eng-name">' + _esc(name) + '</span>' +
-          '<span class="pto-tag' + (ptoEntry.allDay === false ? ' partial' : '') + '">' + _esc(ptoActiveLabel(ptoEntry)) + '</span>' +
-          '</div></div>';
-      } else {
-        const sug = availSuggestions.get(name);
-        const sugSummary = sug ? (adfToText(sug.card.fields.description ? JSON.stringify(sug.card.fields.description) : '', 300) || sug.card.fields.summary) : '';
-        const sugHtml = sug
-          ? ' → <a href="' + BASE + '/browse/' + sug.card.key + '" class="card-key tt"' +
-            ' data-key="' + _esc(sug.card.key) + '" data-title="' + _esc(sug.card.key + ' — ' + trunc(sug.card.fields.summary, 60)) + '" data-summary="' + _esc(sugSummary) + '"' +
-            ' data-url="' + BASE + '/browse/' + sug.card.key + '" target="_blank">' + sug.card.key + '</a> ' +
-            _esc(trunc(sug.card.fields.summary, 50)) + ' <em>(' + (sug.basis || 'next in queue') + ')</em>'
-          : ' — <em>backlog exhausted</em>';
-        teamHtml += '<div class="eng-block"><div class="eng-header">' +
-          '<span class="eng-name">' + _esc(name) + '</span>' +
-          '<span class="avail-note">available' + sugHtml + '</span>' +
-          '</div></div>';
-      }
-    }
+      if (ptoEntry) return { name, pto: { label: ptoActiveLabel(ptoEntry), partial: ptoEntry.allDay === false }, suggestion: null };
+      const sug = availSuggestions.get(name);
+      return {
+        name,
+        pto: null,
+        suggestion: sug ? { key: sug.card.key, summary: trunc(sug.card.fields.summary, 50), basis: sug.basis || 'next in queue' } : null,
+      };
+    });
 
     const lookahead = new Date(NOW + 30 * 86400000).toISOString().slice(0, 10);
-    const avItems = [];
+    const availability = [];
     for (const entry of (ctx.pto || [])) {
       if (entry.end >= todayStr && entry.start <= lookahead) {
         const ongoing = entry.start <= todayStr;
-        const label = ongoing ? ptoReturnsLabel(entry) : ptoUpcomingLabel(entry);
-        const noteSuffix = ongoing && entry.note ? ' (' + _esc(entry.note) + ')' : '';
-        avItems.push({ date: entry.start, html: '<strong>' + _esc(entry.name) + '</strong> — ' + _esc(label) + noteSuffix });
+        availability.push({
+          sortKey: entry.start,
+          name: entry.name,
+          label: ongoing ? ptoReturnsLabel(entry) : ptoUpcomingLabel(entry),
+          note: ongoing ? entry.note : null,
+        });
       }
     }
     for (const ev of (ctx.events || [])) {
       if (ev.date >= todayStr && ev.date <= lookahead) {
-        avItems.push({ date: ev.date, html: fmtDate(ev.date) + ' — ' + _esc(ev.name) + (ev.note ? ' <span class="ev-note">' + _esc(ev.note) + '</span>' : '') });
+        availability.push({ sortKey: ev.date, dateLabel: fmtDate(ev.date), label: ev.name, note: ev.note || null });
       }
     }
-    avItems.sort((a, b) => a.date.localeCompare(b.date));
-    const avHtml = avItems.length
-      ? '<ul class="av-list">' + avItems.map(i => '<li>' + i.html + '</li>').join('') + '</ul>'
-      : '<p class="empty-note">No PTO or events in the next 30 days.</p>';
+    availability.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+    for (const item of availability) delete item.sortKey;
 
-    const css = '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}.wrap{max-width:960px;margin:0 auto;padding:32px 20px}header{margin-bottom:28px}h1{font-size:1.7rem;font-weight:700;color:#0f172a;letter-spacing:-.02em}.tagline{margin-top:6px;color:#64748b;font-size:.93rem}.tagline a{color:#3b82f6;text-decoration:none}.tagline a:hover{text-decoration:underline}.card{background:#fff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.07)}h2{font-size:1.05rem;font-weight:600;color:#0f172a;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #f1f5f9}.metrics-row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem;color:#475569}.metrics-row strong{color:#0f172a}.chart-wrap{margin-top:20px}.eng-block{padding:14px 0;border-bottom:1px solid #f1f5f9}.eng-block:last-child{border-bottom:none;padding-bottom:0}.eng-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}.eng-name{font-weight:600;color:#0f172a;font-size:.97rem}.eng-count{color:#64748b;font-size:.85rem}.wip-badge{padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600;text-decoration:none}.wip-badge.critical{background:#fee2e2;color:#991b1b}.wip-badge.concern{background:#fef3c7;color:#92400e}.pto-tag{background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600}.pto-tag.upcoming{background:#e0f2fe;color:#0369a1}.pto-tag.partial{background:#fef9c3;color:#854d0e}.avail-note{color:#64748b;font-size:.88rem}a.card-key{font-weight:600;color:#3b82f6;text-decoration:none;white-space:nowrap;font-size:.85rem}a.card-key:hover{text-decoration:underline}.card-list{list-style:none;padding-left:4px}.card-list li{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:.88rem}.card-title{color:#374151}.card-status{font-weight:600;color:#0f172a;white-space:nowrap}.card-age{color:#64748b;white-space:nowrap}.card-age.over-sle{color:#ef4444;font-weight:700}.av-list{list-style:none}.av-list li{padding:7px 0;border-bottom:1px solid #f1f5f9;color:#374151;font-size:.9rem}.av-list li:last-child{border-bottom:none}.ev-note{color:#64748b;font-size:.85rem}.empty-note,.recs-placeholder{color:#94a3b8;font-style:italic;font-size:.9rem}#wip-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:300px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#wip-tip .tk{font-weight:700;font-size:13px}#wip-tip .td{margin-top:2px;color:#94a3b8;font-size:11px}#wip-tip .tl{margin-top:8px;pointer-events:auto}#wip-tip .tl a{color:#60a5fa;text-decoration:none;font-weight:600}#wip-tip .tl a:hover{text-decoration:underline}#recs-content h3{font-size:.97rem;font-weight:600;color:#0f172a;margin:20px 0 8px}#recs-content h3:first-child{margin-top:0}#recs-content p{margin-bottom:10px;color:#374151;font-size:.9rem}#recs-content ul,#recs-content ol{padding-left:20px;margin:0 0 14px;font-size:.9rem;color:#374151}#recs-content li{margin-bottom:6px;line-height:1.5}#recs-content a{color:#3b82f6;text-decoration:none}#recs-content a:hover{text-decoration:underline}.pr-info{color:#94a3b8;font-size:.8rem}.pr-missing{color:#f97316}.pr-not-needed{color:#16a34a;font-weight:500}.pr-link{color:#60a5fa;text-decoration:none}.pr-link:hover{text-decoration:underline}.pr-approved{color:#22c55e;font-weight:600}.pr-changes-requested{color:#ef4444;font-weight:600}.pr-review-required{color:#f59e0b;font-weight:600}.monitor-entry{padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:.88rem;color:#374151}.monitor-entry:last-child{border-bottom:none}.monitor-time{font-weight:600;color:#0f172a}.monitor-nochange{color:#94a3b8;font-style:italic}.rec-added{border-left:3px solid #22c55e;padding:4px 0 4px 12px;margin-bottom:12px;background:#f0fdf4;border-radius:0 6px 6px 0}.rec-removed{border-left:3px solid #ef4444;padding:4px 0 4px 12px;margin-bottom:12px;background:#fff1f2;border-radius:0 6px 6px 0;opacity:.8}.rec-badge{font-size:.75rem;font-weight:700;margin-right:4px}.rec-added .rec-badge::before{content:"✚ ";color:#16a34a}.rec-removed .rec-badge::before{content:"✕ ";color:#dc2626}.rec-removed h3,.rec-removed p,.rec-removed li{text-decoration:line-through;color:#9ca3af}#nd-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:280px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#nd-tip .nd-desc{color:#cbd5e1;font-size:12px}.nd-label{border-bottom:1px dashed currentColor;text-decoration:none!important}.nd-label:hover{opacity:.85}';
-    const js = `const tip=document.getElementById("wip-tip");let pinned=false,pk=null;function showTip(el){const d=el.dataset;const title=d.title||d.key||'';const meta=d.meta||[d.name,d.days?d.days+'d':null,d.status].filter(Boolean).join(' · ');let h='<div class="tk">'+title+'</div>';if(d.summary)h+='<div class="td">'+d.summary+'</div>';if(meta)h+='<div class="td">'+meta+'</div>';if(d.url)h+='<div class="tl"><a href="'+d.url+'" target="_blank">'+(d.linkLabel||'Open in Jira')+' →</a></div>';tip.innerHTML=h;tip.style.display='block';}tip.addEventListener('click',e=>e.stopPropagation());document.querySelectorAll('.wip-card, .tt').forEach(g=>{g.style.cursor='pointer';g.addEventListener('mouseenter',e=>{if(!pinned)showTip(e.currentTarget);});g.addEventListener('mousemove',e=>{if(!pinned){tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';}});g.addEventListener('mouseleave',()=>{if(!pinned)tip.style.display='none';});g.addEventListener('click',e=>{e.stopPropagation();const k=e.currentTarget.dataset.key;if(pinned&&pk===k){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}else{pinned=true;pk=k;showTip(e.currentTarget);tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';tip.style.pointerEvents='auto';}});});document.addEventListener('click',()=>{if(pinned){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});document.addEventListener('keydown',e=>{if(e.key==='Escape'){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});(function(){var el=document.getElementById('recs-content');if(el&&el.innerHTML.indexOf('RECOMMENDATIONS_PLACEHOLDER')!==-1){el.innerHTML='<p class="recs-placeholder">Recommendations loading…</p>';var iv=setInterval(function(){location.reload();},2000);setTimeout(function(){clearInterval(iv);},60000);}})();(function(){var ml=document.getElementById('monitor-log');var mc=document.getElementById('monitoring');if(ml&&mc&&ml.innerHTML.indexOf('MONITORING_LOG_PLACEHOLDER')===-1){mc.style.display='';}var iv2=setInterval(function(){if(ml&&mc&&ml.innerHTML.indexOf('MONITORING_LOG_PLACEHOLDER')===-1){mc.style.display='';clearInterval(iv2);}},3000);})();(function(){var nl=document.querySelector('.nd-label');var nt=document.getElementById('nd-tip');if(!nl||!nt)return;var dd=nt.querySelector('.nd-desc');nl.addEventListener('mouseenter',function(e){var desc=nl.dataset.desc;if(!desc)return;dd.textContent=desc;nt.style.left=(e.clientX+14)+'px';nt.style.top=(e.clientY-40)+'px';nt.style.display='block';});nl.addEventListener('mousemove',function(e){nt.style.left=(e.clientX+14)+'px';nt.style.top=(e.clientY-40)+'px';});nl.addEventListener('mouseleave',function(){nt.style.display='none';});})();`;
-
-    return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>' + _esc(PROJECT) + ' Standup — ' + _esc(dateLabel) + '</title>\n<style>' + css + '</style>\n</head>\n<body>\n<div class="wrap">\n' +
-      '<header><h1>' + _esc(PROJECT) + ' Standup — ' + _esc(dateLabel) + '</h1>' +
-      (nationalDay ? '<p class="tagline">Today is: <a class="nd-label" href="' + _esc(ndUrl || '#') + '" target="_blank" data-desc="' + _esc(nationalDay.description || '') + '">' + _esc(nationalDay.name) + '</a></p>' : '') +
-      '</header>\n' +
-      '<!-- SEC:metrics -->\n<div class="card" id="kanban-metrics"><h2>Kanban Metrics</h2>' +
-      '<div class="metrics-row"><span><strong>85th Percentile (SLE):</strong> ' + sleDays + ' days</span><span><strong>Median:</strong> ' + medianDays + ' days</span><span><strong>Sample:</strong> ' + sampleCount + ' completed cards (last 28 days)</span><span><strong>Runway:</strong> ' + plannedReadyCount + ' ready card' + (plannedReadyCount !== 1 ? 's' : '') + (runwayWeeks !== null ? ' (~' + runwayWeeks + 'w)' : '') + '</span></div>' +
-      '<div class="chart-wrap">' + svg + '</div></div>\n<!-- /SEC:metrics -->\n' +
-      '<!-- SEC:team -->\n<div class="card" id="team-status"><h2>Team Status</h2>' + teamHtml + '</div>\n<!-- /SEC:team -->\n' +
-      '<div class="card" id="recommendations"><h2>Recommendations</h2><div id="recs-content"><!-- RECOMMENDATIONS_PLACEHOLDER --></div></div>\n' +
-      '<div class="card"><h2>Availability and Upcoming Events</h2>' + avHtml + '</div>\n' +
-      '<!-- SEC:monitor -->\n<div class="card" id="monitoring" style="display:none"><h2>Live Updates <span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280"></span></h2><div id="monitor-log"><!-- MONITORING_LOG_PLACEHOLDER --></div></div>\n<!-- /SEC:monitor -->\n' +
-      '</div>\n<div id="wip-tip"></div><div id="nd-tip"><div class="nd-desc"></div></div>\n<script>' + js + '<\/script>\n' +
-      '<script>(function(){var _ids=[\'monitor-log\',\'kanban-metrics\',\'team-status\',\'recs-content\',\'monitor-last-checked\'];var _kn={};_ids.forEach(function(id){var el=document.getElementById(id);_kn[id]=el?el.innerHTML:\'\';});setInterval(function(){var xhr=new XMLHttpRequest();xhr.open(\'GET\',location.href,true);xhr.onload=function(){try{var doc=new DOMParser().parseFromString(xhr.responseText,\'text/html\');_ids.forEach(function(id){var nel=doc.getElementById(id);var oel=document.getElementById(id);if(nel&&oel&&nel.innerHTML!==_kn[id]){_kn[id]=nel.innerHTML;oel.innerHTML=nel.innerHTML;if(id===\'monitor-log\'||id===\'monitor-last-checked\'){var mc=document.getElementById(\'monitoring\');if(mc)mc.style.display=\'\';}}})}catch(e){}};xhr.send();},15000);})();<\/script>\n' +
-      '</body>\n</html>';
+    return {
+      projectName: PROJECT,
+      dateLabel,
+      nationalDay: nationalDay ? { name: nationalDay.name, url: nationalDay.dayUrl, description: nationalDay.description || '' } : null,
+      metrics: sampleCount > 0 ? { sleLabel, medianLabel, sampleCount, historyDays: SLE_HISTORY_DAYS, readyCardCount, runwayWeeks } : null,
+      chartSvg,
+      engineers,
+      available: availableList,
+      availability,
+      issues,
+      prs,
+      recommendations: [],
+    };
   }
 
   // Group in-flight rows by engineer; sort each engineer's cards right-to-left then longest first
@@ -1048,7 +1303,7 @@ console.log = (...args) => { _origLog(...args); };
       const basisLabel = basis ? `matched: ${basis}` : 'next in queue';
       console.log(`**${name}** · available → [${card.key}](${BASE}/browse/${card.key}) ${trunc(card.fields.summary, 45)}${ptLabel} _(${basisLabel})_${upcomingSuffix}`);
     } else {
-      console.log(`**${name}** · available _(${backlog.length ? 'backlog exhausted' : 'no "Selected For Development" cards'})_${upcomingSuffix}`);
+      console.log(`**${name}** · available _(${backlog.length ? 'backlog exhausted' : 'no "Selected for Development" cards'})_${upcomingSuffix}`);
     }
   }
 
@@ -1090,58 +1345,47 @@ console.log = (...args) => { _origLog(...args); };
     }
   }
 
-  // ── Write standup HTML to a dated temp file ──────────────────────────────────
-  const _fs = require('fs'), _path = require('path'), _os = require('os');
-  const medianDays = cycleTimes.length ? Math.round(percentile(cycleTimes, 0.5) / 86400000) : 0;
-  const _sDate = new Date().toISOString().slice(0, 10);
-  const _sOut = _path.join(_os.tmpdir(), `standup-${_sDate}${draftMode ? '-draft' : ''}.html`);
-  if (!noHtml) {
-    _fs.writeFileSync(
-      _sOut,
-      generateStandupHtml({
-        dateLabel: todayLabel,
-        nationalDay: pickedNationalDay,
-        sleDays: computedSleDays,
-        medianDays,
-        sampleCount: cycleTimes.length,
-        plannedReadyCount,
-        runwayWeeks,
-        rows,
-        engineerEntries,
-        available,
-        availSuggestions,
-      }),
-      'utf8',
-    );
-    console.log('HTML_OUT:' + _sOut);
-    if (!draftMode) {
-      const { execSync: _execSync, spawn: _spawn } = require('child_process');
-      const _path = require('path');
-      const _port = 8765;
-      const _tmpDir = _path.dirname(_sOut);
-      const _fileName = _path.basename(_sOut);
-      const _url = `http://localhost:${_port}/${_fileName}`;
-      const _opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
-
-      let _srvRunning = false;
-      try { _execSync(`lsof -ti:${_port}`, { stdio: 'pipe' }); _srvRunning = true; } catch {}
-
-      if (!_srvRunning) {
-        const _srv = _spawn('python3', ['-m', 'http.server', String(_port), '--bind', '127.0.0.1', '--directory', _tmpDir], {
-          detached: true, stdio: 'ignore',
-        });
-        _srv.unref();
-        // Auto-kill after 1 hour
-        const _killer = _spawn('bash', ['-c', `sleep 3600 && kill ${_srv.pid} 2>/dev/null`], {
-          detached: true, stdio: 'ignore',
-        });
-        _killer.unref();
-        // Give server a moment to start before opening browser
-        _execSync(`bash -c 'sleep 0.6 && ${_opener} "${_url}"' &`);
-      } else {
-        try { _execSync(`${_opener} "${_url}"`); } catch {}
+  // ── Column WIP Violations ────────────────────────────────────────────────────
+  console.log('\n## Column WIP Violations\n');
+  if (!columnLimits.size) {
+    console.log('_No column WIP limits configured on board ' + BOARD_ID + ' (or board config unavailable)._\n');
+  } else {
+    for (const [col, limit] of columnLimits) {
+      const count = columnCardCounts.get(col) ?? 0;
+      // A hard-zero limit means every card in the column is inherently "over" -- that's not
+      // a signal, just the column's nature (e.g. In Review: done, waiting on someone else).
+      // Report it as a plain count instead of an alarm; only a positive limit can be violated.
+      if (limit === 0) {
+        console.log('- **' + col + '**: ' + count + ' card' + (count !== 1 ? 's' : ''));
+        continue;
       }
+      const over = count > limit;
+      console.log('- **' + col + '**: ' + count + '/' + limit + (over ? ' ⚠ OVER LIMIT' : ''));
     }
   }
+
+  // ── Write this run's data blob for Claude to annotate (recommendations, national-day
+  // description), then render with `--render <path>` once those are filled in -- see
+  // .claude/commands/standup.md for the two-step flow. ──────────────────────────────────────
+  const _fs = require('fs'), _path = require('path'), _os = require('os');
+  const medianMs = cycleTimes.length ? percentile(cycleTimes, 0.5) : null;
+  const _sDate = new Date().toISOString().slice(0, 10);
+  const _jOut = _path.join(_os.tmpdir(), `standup-${_sDate}.json`);
+  const reportData = buildReportData({
+    dateLabel: todayLabel,
+    nationalDay: pickedNationalDay,
+    sleDays: computedSleDays,
+    sleLabel: cycleTimes.length ? humanDuration(computedSleMs) : null,
+    medianLabel: medianMs !== null ? humanDuration(medianMs) : null,
+    sampleCount: cycleTimes.length,
+    readyCardCount,
+    runwayWeeks,
+    rows,
+    engineerEntries,
+    available,
+    availSuggestions,
+  });
+  _fs.writeFileSync(_jOut, JSON.stringify(reportData, null, 2) + '\n', 'utf8');
+  console.log('DATA_OUT:' + _jOut);
 
 })().catch(e => { console.error(e.message); process.exit(1); });

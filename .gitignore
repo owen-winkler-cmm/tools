@@ -1,5 +1,11 @@
 .env
 .claude/standup-context.json
+.claude/qpor-defaults.json
+.claude/cmemail/service-directory.json
 /standup.md
 /standup.html
 /metrics.html
+/qpor-*.md
+/project-*.md
+/emreview-*.md
+.claude/emreview/

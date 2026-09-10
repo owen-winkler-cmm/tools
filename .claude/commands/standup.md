@@ -7,6 +7,7 @@
      "holidays" ({ year, dates }) is computed and cached by the script itself once per calendar year -- never edit manually.
      CLI: --exclude "Name1, Name2" or --ignore "Name1, Name2" adds to the default exclude list for this run.
           --project KEY overrides the default Jira project (default: PARCH).
+          --board ID overrides the Jira board ID used for column WIP limits (default: 1967).
           --skip-github skips GitHub PR activity fetching for In Review cards (faster, less data). -->
 
 If $ARGUMENTS contains a natural-language exclusion request (e.g. "omit Jeffrey and Thomas", "exclude Richard", "ignore Thomas and Jeffrey") or uses --ignore, extract the names and rewrite the command using --exclude:
@@ -21,7 +22,7 @@ Otherwise run:
 node .claude/scripts/standup.js $ARGUMENTS
 ```
 
-The script writes the HTML report to a dated temp file, opens it in the default browser, and prints the exact output path to stdout on a line starting with `HTML_OUT:`. It also outputs a markdown data summary to stdout.
+This fetches everything and writes a data blob to a dated temp path, printed as `DATA_OUT:<path>`, plus a markdown summary to stdout. It does not open anything yet -- Recommendations and the national-day description still need to be generated (see below) before there's anything worth looking at.
 
 Once you have the stdout output:
 
@@ -38,7 +39,8 @@ Write recommendations as a team facilitator, not a manager. These appear in stan
 
 Recommendations must cover:
 
-- **WIP violations**: anyone over 1 active card (flag 2 as a concern, 3+ as critical); count collaborator cards toward effective WIP, not just assigned cards
+- **Column WIP violations (lead with these)**: check the Column WIP Violations section first. A column with a hard zero limit (e.g. In Review) is reported as a plain count, not an alarm -- every card there is inherently "over" a zero limit, so that's not itself a signal, just how many cards are done and waiting on someone else's action (review sign-off, AI check, merge). Name every card in that column and state exactly what needs to happen to clear it, without framing the count as a violation. Any column marked ⚠ OVER LIMIT (a positive limit actually exceeded) is a real systemic flow blocker affecting the whole team; name the column, the count, and the limit, and ask what the team can do to pull work forward before starting anything new.
+- **WIP violations**: anyone over 1 *actively in-progress* card (flag 2 as a concern, 3+ as critical). Cards sitting in a review-type status are done and waiting on someone else, not competing for the engineer's attention -- don't count them here. Count collaborator cards toward effective WIP, not just assigned cards
 - **Collaboration concentration**: flag any engineer carrying heavy collaborator load alongside their own assigned work; call out cards where the collaborator count is high enough to suggest the work should be reassigned or split
 - **Escalation candidates**: any card marked ⚠ in the cycle time report has exceeded its story-point-adjusted SLE. For each, identify the blocker type (external dependency, waiting on response, unclear scope, under-resourced, etc.) and recommend a concrete escalation action -- whether to reassign, park as blocked, pair someone on it, or escalate to a dependency owner. These take priority over generic aging flags.
 - **Aging items**: flag anything beyond 1 week in any status not already covered by escalation; treat 2+ weeks as critical and name the blocker type
@@ -51,96 +53,41 @@ Recommendations must cover:
 
 Format recommendations as markdown. Use headers, bold text, and bullet lists -- no pipe tables. Every ticket reference must be a markdown link to its Jira card (https://covermymeds.atlassian.net/browse/ISSUE-nnn). Name engineers and tickets specifically, but frame actions as questions and suggestions, not orders. Prioritize by flow impact, not by age alone.
 
-After generating recommendations, identify the output path from the `HTML_OUT:` line in stdout, then use the Edit tool on that file to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.
+After generating recommendations, identify the data file from the `DATA_OUT:` line in stdout, then use the Edit tool on that file to replace the empty `"recommendations"` array with one entry per block:
 
-Every ticket link must carry the same hover-tooltip data attributes used elsewhere in the report, so hovering it shows the ticket summary: `<a href="https://covermymeds.atlassian.net/browse/TICKET-nnn" class="card-key tt" data-key="TICKET-nnn" data-title="TICKET-nnn" data-summary="SUMMARY" data-url="https://covermymeds.atlassian.net/browse/TICKET-nnn">TICKET-nnn</a>`, where `SUMMARY` is the ticket's summary text from the stdout data (HTML-escape it).
+- `{"type": "heading", "text": "..."}`
+- `{"type": "paragraph", "text": "..."}`
+- `{"type": "list", "items": ["...", "..."]}`
 
-If a recommendation mentions a specific PR, its link needs the matching set too -- don't drop this: `<a href="PR_URL" class="pr-link tt" data-key="pr-NUM" data-title="PR #NUM · REPO" data-summary="SUMMARY" data-meta="META" data-url="PR_URL" data-link-label="Open PR">PR #NUM</a>`, where `SUMMARY` is a short description of the PR and `META` is status context (e.g. review decision, last activity) -- both from the stdout GitHub data.
+Write ticket keys (`PARCH-932`) and PR mentions (`PR #120`) as plain text inside `text`/`items` strings -- do not hand-write `<a>` tags or data-* attributes for them. The render step auto-linkifies any mention of a known key against the `issues`/`prs` pool in the same JSON file into a link with the same hover card used everywhere else. `**bold**` inside a block's text is rendered as emphasis, so a name or key can still be called out without needing raw HTML.
 
-**National day tooltip:** The stdout's **Today is:** line includes the day's URL in parentheses. Fetch that page and, in one or two short, factual sentences, explain what the day is and why it's observed -- skip fluffy "this day celebrates" framing, get straight to the substance. Use the Edit tool on the HTML_OUT file to set that text as the `data-desc` attribute on the `<a class="nd-label" ...>` tag (HTML-escape it), replacing whatever is currently there (often empty).
+**National day tooltip:** The stdout's **Today is:** line includes the day's URL in parentheses. Fetch that page and, in one or two short, factual sentences, explain what the day is and why it's observed -- skip fluffy "this day celebrates" framing, get straight to the substance. Edit the JSON file's `nationalDay.description` field to that text (a plain JSON string -- no HTML escaping, no attribute syntax to get wrong). It's usually pre-filled with a shorter teaser scraped from the listing page; replace it with your fetched summary.
 
-Finally, open the HTML file in the browser using the path from the `HTML_OUT:` line: `open <HTML_OUT path>`
+Once both edits are made, render the final report and stop -- do not read the JSON back to check it:
 
----
+```bash
+node .claude/scripts/standup.js --render <path from DATA_OUT>
+```
 
-## Live Board Monitoring (optional)
+This reads the completed data file and writes a dated `standup-YYYY-MM-DD.html` to the OS temp directory (printed as `REPORT_OUT:<path>`), not the working directory: one fully self-contained, static HTML file (data baked in, no separate JSON file, no fetch, no CDN, no live polling) that's safe to move, email, or open offline, and gets cleaned up automatically on reboot rather than littering the repo. The script opens it once itself -- do not open or re-open it yourself, and do not offer or set up live board monitoring: no extra `open` command, no browser tool, no AskUserQuestion about monitoring, no CronCreate job.
 
-After injecting recommendations, use AskUserQuestion with:
-- header: "Live updates"
-- question: "Monitor the Jira board for changes and auto-update the standup page?"
-- options:
-  1. label: "Every 2 min for 30 min", description: "Recommended default — checks every 2 minutes and updates the page if anything changes."
-  2. label: "Custom interval", description: "Specify your own check interval and duration."
-  3. label: "No monitoring", description: "Skip live updates."
+## Publish to Confluence
 
-**If "No monitoring":** stop here.
+After `--render` prints `REPORT_OUT:`, publish the same recommendations to the team's standup page: cloudId `covermymeds.atlassian.net`, pageId `4048945159` (https://covermymeds.atlassian.net/wiki/spaces/PLATFORM/pages/4048945159/Standup).
 
-**If "Every 2 min for 30 min" or "Custom interval":**
+0. Before anything else, verify the page is still reachable with a `getConfluencePage` call on the pageId above -- confirm it returns and the title is still "Standup" (or a page under the same space/URL). The pageId is hard-coded here and Confluence page IDs do not change on their own, but if this ever comes back not-found or clearly wrong, stop, report it, and ask for the current page before touching anything.
+1. Fetch the current body (same call as step 0 covers this). Its shape is fixed: an `<h2>Standup Report</h2>` heading, a content slot, a `<hr>`, then a `<h2>To-Do List</h2>` section and whatever follows it.
+2. Replace only the content slot between the `<h2>Standup Report</h2>` heading and the next `<hr>` -- leave the To-Do List section and everything else in the page byte-for-byte untouched. This overwrites whatever was there from the previous run; the page is a live snapshot of today's actions to consider, not an accumulating history.
+3. The very first element of that content slot, every run, is the national day: `<p><a href="<national day URL>"><national day name></a> · <dateLabel></p>` -- the URL and name come from the stdout `Today is:` line, the date from `dateLabel` in the JSON data file. This is not conditional; every run has one.
+4. Immediately after the national-day line, embed the aging WIP chart as an image (also not conditional -- every run):
+   a. Extract `chartSvg` from the JSON data file and write it to a temp `.svg` file.
+   b. Convert it to PNG with `rsvg-convert -w 820 -h 400 --background-color=white <svg path> -o <png path>` (requires `rsvg-convert`, e.g. `brew install librsvg` -- if it's not on PATH, skip the image, note it in the run summary, and continue with the rest of the Confluence publish rather than blocking on it).
+   c. Upload the PNG as a page attachment via a raw REST call (the Atlassian Rovo MCP has no attachment-upload tool, so this goes around it): `curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" -X POST -H "X-Atlassian-Token: nocheck" -F "file=@<png path>;type=image/png" -F "comment=Standup aging WIP chart" "https://covermymeds.atlassian.net/wiki/rest/api/content/4048945159/child/attachment"`. From the JSON response take `results[0].extensions.fileId` and `results[0].extensions.collectionName` -- these are real Media Services identifiers (not the legacy `att...` attachment ID), safe to use directly in a media node.
+   d. Embed it: `<figure data-type="media-single" data-layout="center" data-width="80"><div data-type="media" data-media-type="file" data-id="<fileId>" data-collection="<collectionName>" data-alt="Aging WIP chart"></div></figure>`. Each run uploads a fresh attachment and points the figure at the new one -- don't try to reuse or overwrite a prior day's attachment.
+5. After the chart, convert the same `recommendations` blocks you wrote to the JSON data file into Confluence HTML: `heading` → `<h3>`, `paragraph` → `<p>`, `list` → `<ul><li>`. Confluence has no hover-card mechanism, so resolve every ticket key and `PR #nnn` mention to a real working link instead: `<a href="https://covermymeds.atlassian.net/browse/PARCH-nnn">PARCH-nnn</a>` for tickets, the actual PR URL (from the same data file's `prs` pool) for PR mentions. Render `**bold**` markers as `<strong>`. **Every** Jira ticket key that appears anywhere in the content -- including inside a bolded or otherwise-marked-up mention, and on every repeat of the same key across sections -- must be wrapped in its Jira link; a plain-text ticket code slipping through unlinked is a bug, not a style choice. Before publishing, scan your own draft HTML for the `[A-Z]+-[0-9]+` pattern and confirm each match sits inside an `<a href>`.
+6. Call `getContentFormatGuide` with `{ toolName: "updateConfluencePage" }` before authoring the HTML if you haven't already this session, and follow its nesting rules.
+7. Call `updateConfluencePage` with the full merged body (unchanged heading + national-day line + chart figure + new recommendations HTML + `<hr>` + everything after, untouched) and a `versionMessage` like "Standup — YYYY-MM-DD".
 
-1. If custom, ask: "How often and for how long? (e.g. '5 min for 1 hour')" and parse INTERVAL_MINUTES and DURATION_MINUTES. Default: 2 min / 30 min.
-2. Extract the **Team Status section** from the standup stdout: everything from `## Team Status` up to (but not including) `## Multi-Ticket Owners`.
-3. Write `/tmp/standup-monitor-state.json`:
-   ```json
-   {
-     "htmlPath": "<HTML_OUT path from stdout>",
-     "snapshotTeamStatus": "<extracted Team Status markdown>",
-     "cliArgs": "<the CLI args used, e.g. '--exclude \"Derik Pell\"', or empty string>",
-     "expiresAt": <Math.floor(Date.now()/1000) + DURATION_MINUTES * 60>,
-     "cronJobId": null
-   }
-   ```
-4. Use CronCreate:
-   - cron: `*/<INTERVAL_MINUTES> * * * *`
-   - recurring: true
-   - prompt: `Standup monitoring check — follow the ## Monitoring Protocol in the owen-standup skill.`
-5. Update the state file: replace `"cronJobId": null` with the returned job ID string.
-6. Report: "Monitoring active — checking every N min until HH:MM."
+If the Atlassian Rovo MCP isn't connected, the page ID no longer resolves, or the update fails, report that clearly and move on -- the local report has already rendered successfully and the run is otherwise complete; don't retry in a loop or block on this step.
 
----
-
-## Monitoring Protocol
-
-**This section runs when the CronCreate job fires.**
-
-1. Run `cat /tmp/standup-monitor-state.json`. If missing or empty, stop silently.
-2. Parse the state. If `Date.now()/1000 > expiresAt`:
-   - Use CronDelete with the cronJobId.
-   - In the HTML at htmlPath, replace `<!-- MONITORING_LOG_PLACEHOLDER -->` with `<div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <span class="monitor-nochange">Monitoring ended.</span></div>` (preserving any existing log entries before it).
-   - Delete the state file: `rm /tmp/standup-monitor-state.json`
-   - Report: "Standup monitoring ended."
-   - Stop.
-3. Run the standup script with `--skip-github --no-html` plus the stored cliArgs to get a fast Jira snapshot (the `--no-html` flag prevents overwriting the existing standup page):
-   ```
-   node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github --no-html <cliArgs>
-   ```
-4. Extract the Team Status section from stdout (same bounds as above).
-4.5. **Merged PR scan for "In Review" cards:** Even when Team Status looks unchanged, Jira lags behind GitHub merges. For each ticket `PARCH-NNN` that appears as "In Review" in `snapshotTeamStatus`, run:
-   ```bash
-   gh pr list --repo covermymeds/drugs-api --state merged --search "PARCH-NNN" --json number,title,mergedAt,author --limit 3 2>/dev/null
-   ```
-   If any PR has a `mergedAt` timestamp within the last 2 hours **and the key `PARCH-NNN#NUMBER` is not already in `knownMergedPRs` in the state file**, collect it as an extra change: `"PARCH-NNN: PR #NNN merged by AUTHOR — card still In Review, needs transition to Done"`. After surfacing a merged PR, add its key (`PARCH-NNN#NUMBER`) to `knownMergedPRs` in the state file so it is not reported again. If any new merged PRs are found, treat the run as "different" and include these entries in the changes array for step 6a (even if the Jira Team Status text is identical).
-5. **If identical to `snapshotTeamStatus` AND no merged PRs found in step 4.5:** update the last-checked timestamp only (no log entry):
-   ```
-   node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
-     --live <htmlPath> --time <HH:MM> --no-changes
-   ```
-   Report "No changes at HH:MM." and stop.
-6. **If different (Team Status changed OR merged PRs found in step 4.5):**
-   a. Diff old (`snapshotTeamStatus`) vs. new Team Status line by line to build a plain-text change list. For each difference identify: status changes (`PARCH-NNN: Old → New`), cards added or removed, PR state changes. Merge in any merged-PR entries collected in step 4.5. Produce a JSON array of short strings, e.g. `["PARCH-786: In Review → Done","PARCH-999 added for Ivan","PARCH-786: PR #140 merged — card still In Review"]`.
-   b. Run the full standup (with GitHub) in **draft mode** — writes a separate draft file without opening the browser:
-      ```
-      node /Users/robert.little/.claude/scripts/owen-standup.js --draft <cliArgs>
-      ```
-      Get DRAFT_PATH from the `HTML_OUT:` line in stdout.
-   c. Run the update helper to merge the draft into the live file. Pass the current time (`HH:MM`) and the JSON change array:
-      ```
-      node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
-        --live <htmlPath from state file> \
-        --draft <DRAFT_PATH> \
-        --time <HH:MM> \
-        --changes '<JSON array from step a>'
-      ```
-      The helper: replaces the Kanban metrics and Team Status sections with fresh data; diffs the recommendations by `<h3>` block (added sections get a ✚ green marker, removed sections get a ✕ strikethrough); prepends the new change entry to the Live Updates log; writes the merged result to the live path.
-   d. Extract the new Team Status section from the full standup stdout and update `snapshotTeamStatus` in the state file.
-   e. Delete the draft file: `rm <DRAFT_PATH>`
-   f. Report: "Board updated at HH:MM: [summary of changes from step a]"
+The standup run is complete once this step succeeds or is reported as skipped.

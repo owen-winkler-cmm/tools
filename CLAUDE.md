@@ -13,10 +13,13 @@ Each slash command is a `.md` file in `.claude/commands/`. Commands that need da
 ```
 .claude/
   commands/       # one .md file per slash command
-  scripts/        # one .js file per script-backed commands
+  scripts/        # one .js file per script-backed command
+  scripts/lib/    # shared modules: jira.js (REST client), flow.js (canonical SLE/throughput)
   assets/         # static assets a command depends on (e.g. the Marp theme)
   standup-context.json   # gitignored; managed by Claude, not edited manually
 ```
+
+`lib/jira.js` and `lib/flow.js` are behavior-preserving extractions of code duplicated across `standup.js`/`metrics.js`/`dora.js`/`o3.js` -- one Jira REST client, one definition of SLE (85th percentile, 28d cycle time, Planned/Ready→Done) and throughput (8-week buckets). Any script needing Jira data or flow math should use these rather than reimplementing them.
 
 ## Jira integration
 
@@ -61,7 +64,9 @@ Performs an EM review of a GitHub pull request for SOX/ITGC compliance. Fetches 
 
 **Requires:** `gh` CLI authenticated + Atlassian Rovo MCP connected. No script -- runs entirely via `gh` and MCP tool calls.
 
-**Output:** A markdown table with ✅/❌/⚠️ per criterion, a plain-English change summary, and a APPROVED/NOT APPROVED/PENDING verdict.
+**Output:** A markdown table with ✅/❌/⚠️ per criterion, a plain-English change summary, and a APPROVED/NOT APPROVED/PENDING verdict. When APPROVED, a bare-URL "Apply approval" line (or two, in order, for the STCM double-approval sequence) gives the exact link(s) to act on -- plain text, not markdown link syntax, so they paste and autolink cleanly in a terminal.
+
+**Deviation log:** `.claude/emreview/findings.jsonl` (gitignored) -- one compact JSON line appended per review that isn't a clean pass (any FAIL/NEEDS INFO, or an APPROVED with a CODEOWNERS gap). Schema: `date`, `repo`, `pr`, `pr_url`, `ticket`, `flow`, `verdict`, `deviations[]` (`criterion`, `name`, `result`, `note`), `codeowners_gap`. Query with `jq`, e.g. which criterion fails most often across repos.
 
 ## /standup
 
@@ -71,11 +76,30 @@ Runs a PARCH kanban standup report (default project). Override with `--project K
 - National day of the day (deterministic pick, same for everyone on a given date)
 - Computed SLE (85th percentile of 28-day cycle time history)
 - Team Status: every active engineer, cards ordered right-to-left by kanban stage then age descending; available engineers get a suggested next backlog card
-- Aging WIP chart: ASCII visualization of card age vs. workflow stage with SLE threshold
+- Aging WIP chart: SVG visualization of card age vs. workflow stage with SLE threshold (`chartSvg` in the data file)
 - Multi-Ticket Owners and Collaborator Load sections (used by Claude for recommendations)
-- Writes `standup.md` to the working directory on every run
+- Writes a dated `standup-YYYY-MM-DD.html` to the OS temp directory on every run (not the working directory, so it's not something to gitignore): one static, self-contained file (no separate data file, no fetch, no live polling) safe to move, email, or open offline, cleaned up automatically on reboot
+- Publishes the same recommendations to Confluence (page 4048945159, PLATFORM space), replacing only the content between the "Standup Report" heading and the following horizontal rule -- the rest of that page (To-Do List, etc.) is left untouched. Connectivity to the page is checked first every run. The national day is always linked at the top of that section, followed by the aging WIP chart rendered as an image (SVG → PNG via `rsvg-convert`, uploaded as a fresh page attachment via a raw REST call to the Confluence attachment API since no MCP tool covers attachment upload -- skipped with a note if `rsvg-convert` isn't installed), then the recommendations. Every Jira ticket key anywhere in the content is a working link -- no plain-text ticket codes. Requires Atlassian Rovo MCP; skipped with a clear note if unavailable, doesn't block the local report.
 
 **PTO handling:** active full-day PTO suppresses backlog suggestions; a partial-day absence (`allDay: false`) only suppresses them while the current time is inside its window. Upcoming PTO (within 7 days) is flagged on the engineer's line. "Returns" and "next work day" dates skip weekends and CMM holidays (see `holidays` in standup-context.json).
+
+## /dora
+
+Produces a DORA + backlog health snapshot -- deployment, flow, and kanban metrics in one dated markdown document, intended for AI context stores and 1:1 briefings.
+
+**Usage:** `/dora [--project KEY] [--repo owner/repo] [--window N]`
+
+**Defaults:** project=PARCH; repos from `DORA_REPOS` env var (comma-separated `owner/r1,owner/r2`), fallback `covermymeds/drugs-api`; window=30d. Deploy-workflow detection matches `DORA_DEPLOY_WORKFLOW` (regex, default `deploy|release|publish`).
+
+**Script:** `.claude/scripts/dora.js`, writes `dora.md` to the working directory and prints the same content to stdout. Lead Time and MTTR are still placeholders -- Lead Time needs future script support, MTTR is filled manually from the incident tool.
+
+## /metrics
+
+Flow metrics report: 8-week rolling kanban health for a single Jira project. Ported from `pce-forecast`; this is the authoritative source going forward.
+
+**Usage:** `/metrics [--project KEY]` (default project: PARCH)
+
+**Script:** `.claude/scripts/metrics.js`, writes `metrics.html` to the working directory and prints a summary (current + 7-week average SLE, average throughput, SLE hit rate, at-risk/breached counts) to stdout.
 
 ## /goalsetting
 
@@ -107,6 +131,50 @@ Produces canonical meta-documents: reference documents that define what must be 
 
 **Workflow:** Interactive interview → markdown draft for review → optional subordinate/template drafts → optional Confluence publish.
 
+## /qpor
+
+Produces a Quarterly Portfolio OKR Review: top-5 work items from the last quarter mapped to the Shared Capabilities FY27 team charter, formatted for a QBR meeting presentation.
+
+**Usage:** `/qpor [--project KEY] [--quarter Q1|Q2|Q3] [--fy FY27]`
+
+**Defaults:** project=PARCH, last completed quarter inferred from today's date.
+
+**Requires:** Atlassian Rovo MCP connected. No script -- runs entirely via MCP tool calls.
+
+**What it produces:**
+- Two ranked sections — **Needs Attention** (blocked, carry over, not started, at-risk items) and **Successes** (completed and on-track items) — up to 5 items each, no repeats
+- Each item formatted with: Goal/Initiative title, Segment Objective, QBR Status, What needs discussed or decided, and Speaker
+- A brief quarter summary paragraph after the two sections
+- Writes `qpor-{quarter}-{fy}.md` to the working directory
+
+**Defaults:** Persisted in `.claude/qpor-defaults.json` (gitignored). If project/quarter/fy are not supplied via flags, the skill prompts once and saves the answers for next time.
+
+**OKR mapping:** Items are mapped to three KR pillars from the team charter: Standards (API contract, ARB, Kafka, API Gateway), Priority APIs (Drugs, Diagnosis, Pharmacy), and Team Health (DORA, satisfaction survey, AI goals, migration tooling).
+
+## /project
+
+Turns a compound goal into a tracked, markdown-backed local project: **issues** that are planned, then completed one at a time by producing an **artifact**.
+
+**Usage:** `/project <verb> [name] [args]`
+- `new [name]` — start a project (interview, or ingest an existing checklist/doc into issues)
+- `plan [name]` — order issues, resolve dependencies, list outstanding inputs, recommend next steps
+- `work <id> [name]` — complete one issue: gather inputs, then draft the artifact or prep a request/template
+- `status [name]` — re-render the tracker; summarize done / blocked / outstanding
+- `refresh [name]` — pull current status of any linked Jira tickets into the file
+- `list` — list all `project-*.md` trackers
+
+**Requires:** Nothing for local work; Atlassian Rovo MCP only for `refresh`. No script.
+
+**State:** One `project-<name>.md` per project is the sole source of truth (gitignored via `/project-*.md`). No JSON, no external tracker -- Claude reads the file, acts, and rewrites it.
+
+**Issue types:**
+- **draft** -- Claude produces the artifact from inputs (a document, plan, register, config spec).
+- **evidence** -- completion needs an external artifact/action Claude cannot fabricate (a test run, pen-test, sign-off, third-party record). `work` produces the request/template and tracks the link; the issue only goes ✅ when real evidence is attached.
+
+**Jira:** Never a tracker. If completing an issue spawns or needs a Jira ticket, its key + URL + status is recorded on that issue and refreshed from Jira on demand; the local file stays authoritative.
+
+**Statuses:** ⬜ todo · 🟡 in progress · 🔵 needs input · ✅ done · ⏭️ deferred (future scope).
+
 ## /mdslides
 
 Authors or validates a CoverMyMeds-branded slide deck as plain, diff-friendly markdown. The `.md` stays minimal (front-matter + headings + content + the occasional per-slide class); all brand styling lives in the theme CSS, so the source parses cleanly for AI and diffs like any code file.
@@ -128,3 +196,43 @@ Authors or validates a CoverMyMeds-branded slide deck as plain, diff-friendly ma
 **Devices:** per-slide classes `title` / `section` / `lead` / `invert`; native `header:`/`footer:` directives for the eyebrow and confidentiality line; and columns via markdown-neutral HTML-comment markers (`<!-- columns -->`, `<!-- col orange|magenta|blue|navy -->`, `<!-- /columns -->`) that the config engine expands into the theme's colored card panels at render time -- no `<div>` or `html: true` in the source, so decks stay formatter-safe. `.claude/assets/marp/example.md` exercises every device.
 
 **Render-instructions header:** every deck carries a one-line HTML comment right after the front-matter -- `<!-- Render this like PowerPoint slides!  ->  https://covermymeds.atlassian.net/wiki/x/DQAT9g -->` -- pointing to the Confluence how-to page ("Rendering CoverMyMeds Marp Slide Decks") that carries the full render + authoring instructions. It renders to nothing on the slides. Update the page, not each deck.
+
+## /o3
+
+Drafts the next recurring 1:1 (O3) note for a named report, mirroring that person's own prior note format. Fills only what primary sources prove -- live flow metrics, active-epic status, recent completions, and carried-forward open threads -- and leaves the narrative (wins framing, people, leadership translation) to the user. Every seeded line carries a strippable glyph so its origin is visible before the note goes upward.
+
+**Usage:** `/o3 <Name> [--project KEY]` · `/o3 finalize <file>`
+
+**Requires:** `node` + Jira `.env` credentials (see Jira integration). No MCP or `gh`. The Microsoft 365 connector gates the run: preflight checks it first, and if it's not authenticated the skill stops and alerts rather than proceeding quietly -- it only continues without MS365 if the user explicitly says so.
+
+**Scripts:** `.claude/scripts/o3.js` (JSON aggregator: WIP with in-progress age, active epics + child rollups + not-Done children, completions in the last N days) plus `.claude/scripts/dora.js` (flow metrics). They run back-to-back so the breach list reconciles to one timestamp; `o3.js` emits WIP ages and the skill flags breached = age > dora's SLE, keeping one source of truth for the flow math.
+
+**Notes location:** `/Users/owinkler/Documents/Prime/Areas/Work/Meetings/O3s/<Name>/<Name> O3 - YYYY-MM-DD.md`. The most recent note in that folder is the format template.
+
+**Glyphs (strippable working marks):** 🆕 new from a primary source · ♻️ carried forward, still open · ✍️ human-fill (your words only) · 🚧 likely question/alarm + a drafted answer to massage. `finalize <file>` strips them.
+
+**What it produces:**
+- A dated note mirroring the person's prior structure, section for section
+- A metrics block with DORA reported as "not yet configured" (no deploy/CFR/lead-time/MTTR proxy), the real kanban flow metrics, breached-SLE cards listed by key + title, and week-over-week deltas framed honestly (delivery reads as delivery, not decline; benign readings cite a verifiable fact)
+- Every "N-1 of N done" bullet naming the specific remaining item and why (from epic children), so the reader's obvious next question is answered in place
+- Candidate wins seeded from recent completions; carried-forward open threads under their sections; ✍️ blanks where only the user's words belong
+
+## /cmemail
+
+Drafts an SLM Change Submission email from a single Jira ticket (a team card, an existing STCM record, or either linked to the other). Fills only what the ticket proves -- description, components, linked STCM/team-card, linked PR, assignee-as-implementer-candidate -- and leaves everything the process requires a human judgment call for (tier justification, risk narrative, approvals, named contacts, verification/monitoring plans) as explicit human-fill placeholders. Never infers change tier from Jira `priority`.
+
+**Usage:** `/cmemail <TICKET-KEY>` · `/cmemail finalize <file>`
+
+**Requires:** Atlassian Rovo MCP connected. No script, no `gh` -- a single-ticket fetch plus linked-issue lookups is well within MCP's remit.
+
+**Template:** `.claude/assets/cmemail/change-submission-email-template.md` -- the field-by-field contract, filled example, and the "what gets sent back for more detail" list this skill maps onto 🚧 warnings.
+
+**Service-directory cache:** `.claude/cmemail/service-directory.json` (gitignored). Maps a service name to its product/operations counterparts and a dated Datadog dependency snapshot, plus the canonical team name and its aliases (Compass isn't active on this Atlassian instance, so there's no structured ownership registry -- this is the substitute, hand-maintained where Confluence is stale or contradictory). Dependency edges refresh cheaply via the Datadog MCP; contacts are human-confirmed only, never re-scraped. Tell Claude in natural language to update it, same as `standup-context.json`.
+
+**Glyphs (strippable working marks):** 🆕 pulled from the Jira ticket or the service-directory cache (source and confidence noted) · ✍️ human-fill, no source exists · 🚧 a field that's a common SLM rejection reason, with the specific trap named inline. `finalize <file>` strips them.
+
+**What it produces:**
+- Subject line: `Change Submission: STCM#### - {description}`, or `{TEAM-KEY} (STCM pending) - {description}` if no STCM record exists yet
+- A ✍️ `To:` line flagging the SLM distribution address as unconfirmed, and a conditional ✍️ `Cc:` line for the director (Medium tier and above)
+- The template's full body -- Change/tier/systems/window, approvals, five-item risk-and-readiness, named resources, post-deployment verification, after-hours monitoring, links -- with every field glyph-marked by provenance
+- Written to `cmemail-<ticket-key>.md` in the working directory

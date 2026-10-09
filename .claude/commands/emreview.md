@@ -2,7 +2,7 @@
      This is NOT a code review. It checks process, traceability, segregation of duties, and testing evidence.
      Usage: /emreview <PR number or URL>
      Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number".
-     Version: 1.8 -->
+     Version: 1.10 -->
 
 ## What an EM review is
 
@@ -214,12 +214,13 @@ Do not flag the absence of a deployment note as a problem. Absence of a hold sig
 
 **8. PR-specific requirements** *(only if an EM review checklist was found in the PR description)*
 
-These are loose, PR-author-defined checks -- not SOX criteria -- but they were explicitly surfaced for the EM, so all must be satisfied before approval.
-- A checklist item marked `[x]` is satisfied.
-- A checklist item marked `[ ]` is not. List unchecked items verbatim in the Notes column.
-- PASS if every item is checked.
-- ⚠️ NEEDS INFO if some items are unchecked.
-- If no EM review checklist was present in the PR, **omit this row entirely** from the table.
+A checkbox's state — checked or not — is never itself the evidence. It's a to-do marker for a human process, and this skill's job is to determine whether the thing it describes is actually true, independent of whether someone happened to tick it. Never take a checked box at face value; never let an unchecked box manufacture a gap that's actually closed. Sort every item by scope, not by its current tick state:
+
+- **If the item restates something criteria 1–7 already assess** (peer review happened, STCM is linked/described/approved, segregation of duties holds, the change is desired to go to production, etc.) — it is always in this skill's purview to verify, checked or not. Resolve it the same way you resolved that criterion, from the same evidence, and ignore what the box currently says. If the underlying criterion passed, the item is satisfied — note "check the box(es) here as completed via this review" plus which ones and why (e.g. "Peer Reviewer box — STCM-19268 is already past peer review per its Manager Approval status"). If the underlying criterion did *not* pass — even if the box is checked — the item is not satisfied; say so and name the contradiction (e.g. "EM Approver box for segregation-of-duties is checked, but the approver and author are the same person").
+- **If the item names something none of criteria 1–7 cover** — a PR-author-specific step (a runbook update, a specific stakeholder ping, a housekeeping task) that is genuinely outside this skill's purview — and you can independently confirm from available data (PR body/comments, linked tickets) that it's actually done, treat it the same way: satisfied on the evidence, not on the tick, note the confirming evidence, tell the EM to check the box if it isn't already.
+- **Only a genuine gap** — an item outside criteria 1–7's coverage that you cannot independently confirm from available data, regardless of its checked state — earns ⚠️ NEEDS INFO (or ❌ FAIL if the data shows it clearly isn't done). Name exactly what's unconfirmed or missing. A checked box on an unverifiable, out-of-purview item is the one case where you have no way to do better than take the author's word for it — note that explicitly rather than silently passing it.
+
+PASS if every item's underlying fact is either independently confirmed or already established by a passing criterion 1–7 — regardless of literal checkbox state. NEEDS INFO only when a genuinely uncovered, unconfirmed item remains. If no EM review checklist was present in the PR, **omit this row entirely** from the table.
 
 ---
 

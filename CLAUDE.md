@@ -219,20 +219,24 @@ Drafts the next recurring 1:1 (O3) note for a named report, mirroring that perso
 
 ## /cmemail
 
-Drafts an SLM Change Submission email from a single Jira ticket (a team card, an existing STCM record, or either linked to the other). Fills only what the ticket proves -- description, components, linked STCM/team-card, linked PR, assignee-as-implementer-candidate -- and leaves everything the process requires a human judgment call for (tier justification, risk narrative, approvals, named contacts, verification/monitoring plans) as explicit human-fill placeholders. Never infers change tier from Jira `priority`.
+A **readiness gate before it is a drafter**: it produces an SLM Change Submission email from a single Jira ticket (a team card, an existing STCM record, or either linked to the other) only when every field an SLM reviewer scans is present and backed by a fact that would earn a plain "approved." It gathers what the ticket, PR, and the conversation prove -- description, components, linked STCM/team-card, linked PR, assignee, approvals (from the PR reviews), back-out plan, testing evidence, window -- then checks each SLM-answer field. If anything is missing it does not just bounce: it shows the full list of gaps, then **interviews the user through the collectable ones over several turns**, each with an example of a good answer, merging each reply in before composing. The one gap it can't collect is a required approval: that must actually be on the PR (typing "it's approved" doesn't count), so the interview preps everything else and the email still waits on the real approval. Never infers change tier from Jira `priority`; never invents a fact to clear the gate. Supplied facts are merged silently as a source. Rationale: a produced email gets sent as-is by someone who may not edit it or know `finalize` exists, and a stale or bounce-prone draft does real harm, so the skill never hands over an artifact that isn't actually ready -- and walks the user to ready rather than leaving them to guess why it bounced.
 
-**Usage:** `/cmemail <TICKET-KEY>` · `/cmemail finalize <file>`
+**Usage:** `/cmemail <TICKET-KEY> [facts missing from the ticket/PR]` · `/cmemail finalize <file>`
 
-**Requires:** Atlassian Rovo MCP connected. No script, no `gh` -- a single-ticket fetch plus linked-issue lookups is well within MCP's remit.
+**Requires:** Atlassian Rovo MCP, `gh` CLI (github.com + git.innova-partners.com, for PR approvals), and Datadog MCP all connected. Preflight checks all three and stops if any is down. No backing script.
 
-**Template:** `.claude/assets/cmemail/change-submission-email-template.md` -- the field-by-field contract, filled example, and the "what gets sent back for more detail" list this skill maps onto 🚧 warnings.
+**Template:** `.claude/assets/cmemail/change-submission-email-template.md` -- the field-by-field contract, filled example, and the "what gets sent back for more detail" list that is now the gate's rejection rubric.
+
+**Approver registry:** `.claude/cmemail/approvers.json` (version-controlled, not gitignored -- change-process policy, same for everyone). Maps people to roles and sets which roles each tier requires an APPROVED PR review from. The gate matches PR review authors by GitHub login against this file. Verifies `peer` + `em`, where EM = Owen Winkler (`owinkler` / `owen-winkler-cmm`), who also holds Director, so one approval from him is the combined EM/Director sign-off. VP (Todd) approves by replying to the generated email, so his approval never appears in the PR/Jira and is deliberately never gated -- he's an email recipient for High/Critical, not a source approval.
 
 **Service-directory cache:** `.claude/cmemail/service-directory.json` (gitignored). Maps a service name to its product/operations counterparts and a dated Datadog dependency snapshot, plus the canonical team name and its aliases (Compass isn't active on this Atlassian instance, so there's no structured ownership registry -- this is the substitute, hand-maintained where Confluence is stale or contradictory). Dependency edges refresh cheaply via the Datadog MCP; contacts are human-confirmed only, never re-scraped. Tell Claude in natural language to update it, same as `standup-context.json`.
 
-**Glyphs (strippable working marks):** 🆕 pulled from the Jira ticket or the service-directory cache (source and confidence noted) · ✍️ human-fill, no source exists · 🚧 a field that's a common SLM rejection reason, with the specific trap named inline. `finalize <file>` strips them.
+**Answer framing:** each SLM question is answered in a first sentence that matches the question's grammatical form (a "how" question leads with the named harm or "NO HARM, because..."; a yes/no question with YES/NO), with the exact phrase SLM scans for in ALL CAPS (caps, not bold, so it survives a plain-text paste), and always carrying a fact rather than a bare affirmation.
 
-**What it produces:**
-- Subject line: `Change Submission: STCM#### - {description}`, or `{TEAM-KEY} (STCM pending) - {description}` if no STCM record exists yet
+**Glyphs:** the gate retires ✍️/🚧 from content fields -- a field that lacks a fact is a gate block, not a shipped warning. The only ✍️ spans in a produced email are the To/Cc delivery lines. `finalize <file>` strips them.
+
+**What it produces (when the gate passes):**
+- Subject line: `Change Submission: STCM#### - {description}`, or `Change Submission: {TEAM-KEY} - {description}` when no STCM applies (no "STCM pending" annotation)
 - A ✍️ `To:` line flagging the SLM distribution address as unconfirmed, and a conditional ✍️ `Cc:` line for the director (Medium tier and above)
-- The template's full body -- Change/tier/systems/window, approvals, five-item risk-and-readiness, named resources, post-deployment verification, after-hours monitoring, links -- with every field glyph-marked by provenance
+- The template's full body -- Change/tier/systems/window, approvals, five-item risk-and-readiness, named resources, post-deployment verification, after-hours monitoring, links -- every content field filled with a sourced fact
 - Written to `cmemail-<ticket-key>.md` in the working directory

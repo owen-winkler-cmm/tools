@@ -1,0 +1,30 @@
+{
+  "_comment": "Approver-role registry for the /cmemail readiness gate. Version-controlled (NOT gitignored) so the gate behaves identically for everyone on the team -- this is change-process policy, not per-user state. The gate reads a PR's approved reviews (github.com or git.innova-partners.com) and checks that an APPROVED review exists from each role the tier requires. GitHub exposes only user.login, so matching is by login. A required role with no login that can be matched is treated as NOT satisfied (the gate blocks and says so) -- it never silently passes. The gate only verifies approvals that actually land in the source (PR reviews / STCM fields); approvals obtained some other way (see vpApproval below) are deliberately out of scope and must never be added as a gate condition.",
+  "roles": {
+    "em": [
+      {
+        "name": "Owen Winkler",
+        "email": "owen.winkler@covermymeds.com",
+        "role": "EM and Director (one person holds both; an APPROVED review from Owen is the EM/Director sign-off)",
+        "logins": {
+          "github.com": "owinkler",
+          "git.innova-partners.com": "owen-winkler-cmm"
+        }
+      }
+    ],
+    "director": "same person as em (Owen Winkler); do not require separately -- the 'em' check already covers the Director authority"
+  },
+  "tierRequiredRoles": {
+    "_comment": "Which approver roles the gate must find an APPROVED review from, per requested tier. 'peer' = any APPROVED review from someone who is neither the PR author nor the 'em' on this list (GitHub won't let an author approve their own PR, so a peer is always distinct). 'em' is Owen, whose single approval is the combined EM/Director sign-off, so Director is never gated separately. VP approval is never gated (see vpApproval).",
+    "Low": ["peer", "em"],
+    "Medium": ["peer", "em"],
+    "High": ["peer", "em"],
+    "Critical": ["peer", "em"]
+  },
+  "vpApproval": {
+    "_comment": "VP sign-off exists in the change process but is obtained THROUGH the generated email, not in the PR or Jira: the VP is a recipient who approves by reply. Its absence from the source is expected and must NEVER be a gate condition -- do not add a 'vp' role to tierRequiredRoles. Recorded here only so the VP is included as an email recipient for the tiers that require VP sign-off.",
+    "name": "Todd",
+    "role": "VP",
+    "note": "Last name / address intentionally left for the requester to fill on the Cc line; confirm before hardcoding."
+  }
+}

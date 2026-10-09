@@ -70,16 +70,20 @@ Performs an EM review of a GitHub pull request for SOX/ITGC compliance. Fetches 
 
 ## /standup
 
-Runs a PARCH kanban standup report (default project). Override with `--project KEY`.
+Runs a PARCH sprint standup report (default project). Override with `--project KEY`; `--board ID` (default 10731, the Dumpster Firefighters Scrum board) and `--sprint ID` override the board / active sprint.
+
+The team moved from a kanban board to a Scrum sprint board (2-week PI-cadence sprints) but still works pull-based; the report is scoped to the active sprint **plus stragglers** (in-flight work not on the sprint, surfaced so it can be pulled in -- never auto-added to Jira) and keeps flow metrics alongside sprint metrics. See memory `project_team_kanban_operating_model` for the mixed/settling model.
 
 **Output includes:**
 - National day of the day (deterministic pick, same for everyone on a given date)
-- Computed SLE (85th percentile of 28-day cycle time history)
-- Team Status: every active engineer, cards ordered right-to-left by kanban stage then age descending; available engineers get a suggested next backlog card
-- Aging WIP chart: SVG visualization of card age vs. workflow stage with SLE threshold (`chartSvg` in the data file)
+- Sprint banner: name, goal, day X of N, and progress (points/cards done vs committed)
+- Computed SLE (85th percentile of 28-day cycle time history) -- flow metrics stay project-wide; only sprint metrics are sprint-scoped. `flow.js` is untouched, so `/metrics`, `/dora`, `/o3` are unaffected
+- Team Status: every active engineer, cards ordered right-to-left by board-column position then age descending; stragglers flagged `not in sprint`; a per-engineer "✓ N done this sprint" chip; available engineers get a suggested next card from the sprint backlog
+- Stragglers section: in-flight cards not on the sprint, listed for a "pull onto the board?" prompt
+- Two metric panels side by side: Flow (aging WIP chart + SLE, `chartSvg`) and Sprint (burndown chart + velocity, `sprintMetrics.burndownSvg`). Burndown is points-based with an unpointed-cards caveat; velocity reads "first tracked sprint" until a sprint closes
 - Multi-Ticket Owners and Collaborator Load sections (used by Claude for recommendations)
 - Writes a dated `standup-YYYY-MM-DD.html` to the OS temp directory on every run (not the working directory, so it's not something to gitignore): one static, self-contained file (no separate data file, no fetch, no live polling) safe to move, email, or open offline, cleaned up automatically on reboot
-- Publishes the same recommendations to Confluence (page 4048945159, PLATFORM space), replacing only the content between the "Standup Report" heading and the following horizontal rule -- the rest of that page (To-Do List, etc.) is left untouched. Connectivity to the page is checked first every run. The national day is always linked at the top of that section, followed by the aging WIP chart rendered as an image (SVG → PNG via `rsvg-convert`, uploaded as a fresh page attachment via a raw REST call to the Confluence attachment API since no MCP tool covers attachment upload -- skipped with a note if `rsvg-convert` isn't installed), then the recommendations. Every Jira ticket key anywhere in the content is a working link -- no plain-text ticket codes. Requires Atlassian Rovo MCP; skipped with a clear note if unavailable, doesn't block the local report.
+- Publishes the same recommendations to Confluence (page 4048945159, PLATFORM space), replacing only the content between the "Standup Report" heading and the following horizontal rule -- the rest of that page (To-Do List, etc.) is left untouched. Connectivity to the page is checked first every run. The national day is linked at the top of that section, then a sprint line (name, day X of N, progress, goal), then the aging WIP chart and sprint burndown rendered as images (SVG → PNG via `rsvg-convert`, uploaded as fresh page attachments via a raw REST call to the Confluence attachment API since no MCP tool covers attachment upload -- skipped with a note if `rsvg-convert` isn't installed), then the recommendations. Every Jira ticket key anywhere in the content is a working link -- no plain-text ticket codes. Requires Atlassian Rovo MCP; skipped with a clear note if unavailable, doesn't block the local report.
 
 **PTO handling:** active full-day PTO suppresses backlog suggestions; a partial-day absence (`allDay: false`) only suppresses them while the current time is inside its window. Upcoming PTO (within 7 days) is flagged on the engineer's line. "Returns" and "next work day" dates skip weekends and CMM holidays (see `holidays` in standup-context.json).
 

@@ -42,6 +42,7 @@ Gitignored. Managed entirely by Claude -- never edit manually (except `holidays`
 ```json
 {
   "defaultExclude": ["Name to always omit"],
+  "nonEngineers": ["Name that is not pulling delivery work"],
   "pto": [
     { "name": "Full Name", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "note": "reason" },
     { "name": "Full Name", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "allDay": false, "startTime": "1:00 PM", "endTime": "5:00 PM" }
@@ -50,7 +51,11 @@ Gitignored. Managed entirely by Claude -- never edit manually (except `holidays`
 }
 ```
 
-Tell Claude in natural language to update it: "Rob is out next week", "remove Jeffrey from the ignore list", "Seyoung is back Thursday", "Dana's out this afternoon 1-5".
+Tell Claude in natural language to update it: "Rob is out next week", "remove Jeffrey from the ignore list", "Seyoung is back Thursday", "Dana's out this afternoon 1-5", "Owen isn't an engineer".
+
+`nonEngineers` lists people (EMs, PMs) who aren't pulling delivery work. Unlike `defaultExclude`, they still appear in Team Status when they own a card; they are only kept out of the "available" list and never offered a backlog suggestion. `defaultExclude` omits a person from the report entirely.
+
+Sprint "Day X of N" and the burndown glide path both count working days only -- weekends and CMM `holidays` carry no capacity, so a 2-week sprint reads as ~10 days and the ideal line holds flat across non-working days instead of declining through them.
 
 PTO entries default to full-day. `allDay: false` + `startTime`/`endTime` marks a partial-day absence -- the engineer is only shown as out during that clock window, not flagged out (or excluded from backlog suggestions) for the whole day.
 
@@ -78,9 +83,9 @@ The team moved from a kanban board to a Scrum sprint board (2-week PI-cadence sp
 - National day of the day (deterministic pick, same for everyone on a given date)
 - Sprint banner: name, goal, day X of N, and progress (points/cards done vs committed)
 - Computed SLE (85th percentile of 28-day cycle time history) -- flow metrics stay project-wide; only sprint metrics are sprint-scoped. `flow.js` is untouched, so `/metrics`, `/dora`, `/o3` are unaffected
-- Team Status: every active engineer, cards ordered right-to-left by board-column position then age descending; stragglers flagged `not in sprint`; a per-engineer "✓ N done this sprint" chip; available engineers get a suggested next card from the sprint backlog
+- Team Status: every active engineer, cards ordered right-to-left by board-column position then age descending; every card (in-flight, straggler, suggested) shows its story points or `unpointed`; stragglers flagged `not in sprint`; a per-engineer "✓ N done this sprint" chip; available engineers get a suggested next card from the sprint backlog
 - Stragglers section: in-flight cards not on the sprint, listed for a "pull onto the board?" prompt
-- Two metric panels side by side: Flow (aging WIP chart + SLE, `chartSvg`) and Sprint (burndown chart + velocity, `sprintMetrics.burndownSvg`). Burndown is points-based with an unpointed-cards caveat; velocity reads "first tracked sprint" until a sprint closes
+- Two metric panels stacked full-width: Flow on top (the aging-WIP "board" chart, `chartSvg`) and Sprint below (burndown chart + velocity, `sprintMetrics.burndownSvg`). The aging-WIP chart is a board view: the sprint board's own columns (grouped via `statusToColumn`, not per-status), each card drawn as a titled chip placed by how long it has sat against the cycle time its story points imply (1≈hrs, 2≈1d, 3≈2.5d, 5≈1wk, 8≈sprint), with point-intent reference lines (1/2/5/8pt) replacing the old single SLE line on a non-uniform duration scale. Severity, review state, and over/approaching-intent notes ride on each card; `.wip-card` hover + `<a>` click-to-Jira are preserved. Burndown is points-based with an unpointed-cards caveat; velocity reads "first tracked sprint" until a sprint closes
 - Multi-Ticket Owners and Collaborator Load sections (used by Claude for recommendations)
 - Writes a dated `standup-YYYY-MM-DD.html` to the OS temp directory on every run (not the working directory, so it's not something to gitignore): one static, self-contained file (no separate data file, no fetch, no live polling) safe to move, email, or open offline, cleaned up automatically on reboot
 - Publishes the same recommendations to Confluence (page 4048945159, PLATFORM space), replacing only the content between the "Standup Report" heading and the following horizontal rule -- the rest of that page (To-Do List, etc.) is left untouched. Connectivity to the page is checked first every run. The national day is linked at the top of that section, then a sprint line (name, day X of N, progress, goal), then the aging WIP chart and sprint burndown rendered as images (SVG → PNG via `rsvg-convert`, uploaded as fresh page attachments via a raw REST call to the Confluence attachment API since no MCP tool covers attachment upload -- skipped with a note if `rsvg-convert` isn't installed), then the recommendations. Every Jira ticket key anywhere in the content is a working link -- no plain-text ticket codes. Requires Atlassian Rovo MCP; skipped with a clear note if unavailable, doesn't block the local report.

@@ -27,6 +27,9 @@ function _esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 }
 function _escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// One story-point label for every card in both outputs, so an estimate (or its absence) reads
+// the same in the markdown, the HTML report, and the over-SLE flag.
+function pointsLabel(pts) { return typeof pts === 'number' ? `${Math.round(pts)}pts` : 'unpointed'; }
 
 // Auto-linkifies any mention of a known Jira key or "PR #N" in free text against the
 // issues/prs pool from the data blob, so Recommendations prose gets the same linked,
@@ -152,6 +155,7 @@ function renderStragglersHtml(data) {
     h += '<li>' + issueAnchor(s.key, issues) +
       '<span class="card-title">' + _esc(s.title) + '</span>' +
       '<span class="card-status">' + _esc(s.status) + '</span>' +
+      '<span class="card-pts">' + _esc(s.pointsLabel) + '</span>' +
       '<span class="card-age">' + s.days + 'd</span>' +
       '<span class="straggler-owner">' + _esc(s.owner || 'unassigned') + '</span></li>';
   }
@@ -172,6 +176,7 @@ function renderTeamHtml(data) {
       h += '<li>' + issueAnchor(c.key, issues) +
         '<span class="card-title">' + _esc(c.titleShort) + '</span>' +
         '<span class="card-status">' + _esc(c.status) + '</span>' +
+        '<span class="card-pts">' + _esc(c.pointsLabel) + '</span>' +
         '<span class="card-age' + (c.over ? ' over-sle' : '') + '">' + c.days + 'd' + (c.over ? ' ⚠' : '') + '</span>';
       if (c.outOfSprint) h += '<span class="not-in-sprint">not in sprint</span>';
       if (c.pr) {
@@ -193,7 +198,7 @@ function renderTeamHtml(data) {
     if (av.pto) {
       h += '<span class="pto-tag' + (av.pto.kind === 'upcoming' ? ' upcoming' : '') + (av.pto.partial ? ' partial' : '') + '">' + _esc(av.pto.label) + '</span>';
     } else if (av.suggestion) {
-      h += '<span class="avail-note">available → ' + issueAnchor(av.suggestion.key, issues) + ' ' + _esc(av.suggestion.summary) + ' <em>(' + _esc(av.suggestion.basis) + ')</em></span>';
+      h += '<span class="avail-note">available → ' + issueAnchor(av.suggestion.key, issues) + ' ' + _esc(av.suggestion.summary) + ' <span class="card-pts">' + _esc(av.suggestion.pointsLabel) + '</span> <em>(' + _esc(av.suggestion.basis) + ')</em></span>';
     } else {
       h += '<span class="avail-note">available — <em>backlog exhausted</em></span>';
     }
@@ -529,6 +534,17 @@ function nextWorkDay(dateStr) {
   while (!isWorkDay(d)) d = addDaysIso(d, 1);
   return d;
 }
+const isoFromMs = ms => new Date(ms).toISOString().slice(0, 10);
+// Count working days (weekdays minus CMM holidays) in [startIso, endIso] inclusive. Weekends and
+// holidays carry no sprint capacity, so both "Day X of N" and the burndown glide path count these.
+function workingDaysBetween(startIso, endIso) {
+  if (startIso > endIso) return 0;
+  let count = 0;
+  for (let d = startIso; d <= endIso; d = addDaysIso(d, 1)) {
+    if (isWorkDay(d)) count++;
+  }
+  return count;
+}
 const NEXT_WORK_DAY = nextWorkDay(addDaysIso(todayStr, 1));
 
 // Parses a "1:00 PM" style clock time onto a given YYYY-MM-DD date, returning epoch ms (local time)
@@ -690,19 +706,22 @@ async function fetchRemoteLinks(issueKey, issueId) {
 
 // Fallback for tickets with zero Jira-side PR data (remote link + dev-status both empty).
 // Jira's dev-status integration doesn't reach the internal GHE host, so a PR living there
-// is otherwise invisible even though `gh` is authenticated to both hosts. Only trusts a
-// search hit whose title explicitly names the issue key, to reject the loose keyword
-// matches `gh search prs` otherwise turns up (e.g. unrelated PRs that happen to share digits).
+// is otherwise invisible even though `gh` is authenticated to both hosts -- common for innova-hosted
+// projects (e.g. Events) whose PRs never link back. Trusts a search hit whose title OR body
+// explicitly names the issue key as a whole word, to reject the loose keyword matches
+// `gh search prs` otherwise turns up (e.g. unrelated PRs that happen to share digits). Title is
+// preferred when both match; the auto-link comment asks a human to confirm a body-only match.
 async function searchGhForIssue(issueKey) {
   const { execFile } = require('child_process');
+  const keyRe = new RegExp(`\\b${issueKey}\\b`, 'i');
   const run = (host) => new Promise(resolve => {
     const env = host === 'github.com' ? process.env : { ...process.env, GH_HOST: host };
-    execFile('gh', ['search', 'prs', issueKey, '--json', 'title,url', '--limit', '20'], { timeout: 15000, env }, (err, stdout) => {
+    execFile('gh', ['search', 'prs', issueKey, '--json', 'title,url,body', '--limit', '20'], { timeout: 15000, env }, (err, stdout) => {
       if (err || !stdout) return resolve(null);
       try {
         const results = JSON.parse(stdout);
-        const keyRe = new RegExp(`\\b${issueKey}\\b`, 'i');
-        const hit = results.find(r => keyRe.test(r.title || ''));
+        const titleHit = results.find(r => keyRe.test(r.title || ''));
+        const hit = titleHit || results.find(r => keyRe.test(r.body || ''));
         resolve(hit ? { url: hit.url, title: hit.title } : null);
       } catch { resolve(null); }
     });
@@ -931,7 +950,7 @@ console.log = (...args) => { _origLog(...args); };
     .filter(s => s.completeDate || s.endDate)
     .sort((a, b) => new Date(b.completeDate || b.endDate) - new Date(a.completeDate || a.endDate));
 
-  const issueFields = ['assignee', 'summary', 'status', 'statuscategorychangedate', STORY_POINTS_FIELD, 'issuetype', 'description'].join(',');
+  const issueFields = ['assignee', 'summary', 'status', 'statuscategorychangedate', 'created', STORY_POINTS_FIELD, 'issuetype', 'description'].join(',');
   const backlogFields = `summary,description,components,priority,${STORY_POINTS_FIELD}`;
 
   // ── Phase 2: the sprint-scoped populations ──────────────────────────────────────────────────
@@ -1061,9 +1080,8 @@ console.log = (...args) => { _origLog(...args); };
     const ms = NOW - new Date(issue.fields.statuscategorychangedate).getTime();
     const sle = sleDays(pts);
     const overSle = ms > sle * 86400000;
-    const ptsLabel = pts != null ? `${Math.round(pts)}pts` : 'unpointed';
     const ct = overSle
-      ? `**${humanDuration(ms)} ⚠** _(SLE: ${sle}d, ${ptsLabel})_`
+      ? `**${humanDuration(ms)} ⚠** _(SLE: ${sle}d)_`
       : humanDuration(ms);
     return {
       name: issue.fields.assignee?.displayName ?? '(unassigned)',
@@ -1110,6 +1128,19 @@ console.log = (...args) => { _origLog(...args); };
   // Story points drive the burndown; cards that carry no estimate are surfaced as a caveat
   // rather than silently dropped. Discarded cards are treated as removed from scope.
   const pointsOf = i => { const p = i.fields[STORY_POINTS_FIELD]; return typeof p === 'number' ? p : 0; };
+  // When did an issue first enter THIS sprint, per its Sprint-field changelog? null if no such event
+  // (added at creation or carried in off a board), in which case the created date decides.
+  function sprintEnterMs(issue) {
+    const hist = [...(issue.changelog?.histories || [])].sort((a, b) => new Date(a.created) - new Date(b.created));
+    for (const h of hist) {
+      for (const it of (h.items || [])) {
+        if (it.field === 'Sprint' && String(it.to || '').split(/\s*,\s*/).filter(Boolean).includes(String(sprint.id))) {
+          return new Date(h.created).getTime();
+        }
+      }
+    }
+    return null;
+  }
   function computeSprintMetrics() {
     if (!sprint) return null;
     const inScope = sprintIssues.filter(i => i.fields.status?.name !== 'Discard');
@@ -1118,35 +1149,56 @@ console.log = (...args) => { _origLog(...args); };
     const unpointed = inScope.filter(i => typeof i.fields[STORY_POINTS_FIELD] !== 'number').length;
     const startMs = sprint.startDate ? new Date(sprint.startDate).getTime() : null;
     const endMs = sprint.endDate ? new Date(sprint.endDate).getTime() : null;
-    // Burn events: only cards that are *currently* Done (a card that reached Done and was later
-    // reopened must not count), timed by their first Done transition. Pre-start / day-0
-    // completions (carryover) are clamped to day 1 so the actual line still starts at the full
-    // committed total on day 0.
-    const DAY = 86400000;
-    const doneEvents = sprintDoneIssues
-      .map(i => ({ pts: pointsOf(i), at: firstDoneMs(i) }))
-      .filter(e => e.at != null);
-    const burnDay = at => Math.max(1, Math.round((at - startMs) / DAY));
     const series = [];
+    let startScope = committedPoints, addedPoints = 0, addedCards = 0;
     if (startMs && endMs && endMs > startMs) {
-      const totalDays = Math.max(1, Math.round((endMs - startMs) / DAY));
-      // How many sprint days have actually elapsed -- the actual line is drawn through here
-      // (inclusive) so "today" is always plotted, even in the first 24h.
-      const elapsedDays = Math.min(totalDays, Math.max(0, Math.round((NOW - startMs) / DAY)));
-      for (let d = 0; d <= totalDays; d++) {
-        const burned = doneEvents.reduce((s, e) => burnDay(e.at) <= d ? s + e.pts : s, 0);
+      const startIso = isoFromMs(startMs), endIso = isoFromMs(endMs), EPS = 60000;
+      // The burndown runs on working days only, so its axis matches the sprint's "Day X of N".
+      // A timestamp maps to the count of sprint working days elapsed through its date (weekends and
+      // holidays fold back onto the prior working day); clamped to [0, totalWorking].
+      const totalWorking = Math.max(1, workingDaysBetween(startIso, endIso));
+      const wdIndex = at => {
+        const iso = isoFromMs(at);
+        if (iso <= startIso) return 0;
+        if (iso >= endIso) return totalWorking;
+        return workingDaysBetween(startIso, iso);
+      };
+      // Scope: cards present at sprint start vs pulled in / created after it started.
+      startScope = 0;
+      const addEvents = [];
+      for (const i of inScope) {
+        const pts = pointsOf(i);
+        const enterMs = sprintEnterMs(i);
+        const createdMs = i.fields.created ? new Date(i.fields.created).getTime() : null;
+        const atStart = enterMs != null ? enterMs <= startMs + EPS : (createdMs == null || createdMs <= startMs + EPS);
+        if (atStart) startScope += pts;
+        else { addEvents.push({ pts, wd: Math.max(1, wdIndex(enterMs != null ? enterMs : createdMs)) }); addedCards++; }
+      }
+      addedPoints = addEvents.reduce((s, e) => s + e.pts, 0);
+      // Burn events: cards *currently* Done, by their first Done transition, mapped to a working day.
+      const doneEvents = sprintDoneIssues
+        .map(i => ({ pts: pointsOf(i), at: firstDoneMs(i) }))
+        .filter(e => e.at != null)
+        .map(e => ({ pts: e.pts, wd: Math.max(1, wdIndex(e.at)) }));
+      const todayIso = isoFromMs(NOW);
+      const elapsedWorking = workingDaysBetween(startIso, todayIso < startIso ? startIso : (todayIso > endIso ? endIso : todayIso));
+      for (let k = 0; k <= totalWorking; k++) {
+        const burned = doneEvents.reduce((s, e) => e.wd <= k ? s + e.pts : s, 0);
+        const added = addEvents.reduce((s, e) => e.wd <= k ? s + e.pts : s, 0);
+        const committed = startScope + added;
         series.push({
-          day: d,
-          ideal: Math.max(0, committedPoints * (1 - d / totalDays)),
-          remaining: committedPoints - burned,
-          future: d > elapsedDays,
+          day: k,
+          ideal: Math.max(0, startScope * (1 - k / totalWorking)), // glide from the original commitment
+          remaining: committed - burned,
+          committed, // steps up as scope is pulled in mid-sprint
+          future: k > elapsedWorking,
         });
       }
     }
     return {
       committedPoints, donePoints,
       totalCards: inScope.length, doneCards: sprintDoneIssues.length,
-      unpointed, startMs, endMs, series,
+      unpointed, startMs, endMs, series, startScope, addedPoints, addedCards,
     };
   }
   const sprintMetrics = computeSprintMetrics();
@@ -1168,15 +1220,20 @@ console.log = (...args) => { _origLog(...args); };
   }
   const velocity = await computeVelocity();
 
-  // Sprint day counter: "Day X of N". X is clamped into [1, N] so a just-started or overrunning
-  // sprint still reads sensibly.
+  // Sprint day counter: "Day X of N", counting working days only -- weekends and CMM holidays are
+  // not sprint capacity, so a 2-week sprint reads as ~10 days, not 14. X is clamped into [1, N] so
+  // a just-started or overrunning sprint still reads sensibly.
   function sprintDayInfo() {
     if (!sprint?.startDate || !sprint?.endDate) return null;
     const startMs = new Date(sprint.startDate).getTime();
     const endMs = new Date(sprint.endDate).getTime();
-    const totalDays = Math.max(1, Math.round((endMs - startMs) / 86400000));
-    const elapsed = Math.round((NOW - startMs) / 86400000) + 1;
-    return { day: Math.min(Math.max(elapsed, 1), totalDays), total: totalDays, endMs };
+    const startIso = isoFromMs(startMs);
+    const endIso = isoFromMs(endMs);
+    const total = Math.max(1, workingDaysBetween(startIso, endIso));
+    const todayIso = isoFromMs(NOW);
+    const clamped = todayIso < startIso ? startIso : (todayIso > endIso ? endIso : todayIso);
+    const elapsed = workingDaysBetween(startIso, clamped);
+    return { day: Math.min(Math.max(elapsed, 1), total), total, endMs };
   }
   const sprintDay = sprintDayInfo();
 
@@ -1293,95 +1350,188 @@ console.log = (...args) => { _origLog(...args); };
     return esc.split(/\n+/).map(l => l.trim()).filter(Boolean).join('<br>');
   }
 
+  // Aging-WIP "board" chart: the sprint board's own columns, each card placed by how long it has
+  // sat vs the cycle time its story points imply (not a single global SLE). Full-width; the burndown
+  // stacks underneath it. Titles ride on the cards; .wip-card data-* + the <a> wrapper keep the
+  // existing hover tooltip and click-to-Jira behavior. sleDays is retained for signature parity.
   function generateAgingWipSvg(inFlightRows, sleDays, issueStore) {
     if (!inFlightRows.length) return '<p><em>No in-flight cards.</em></p>';
-    // Fonts sized for ~half page width (shares a side-by-side row with the burndown chart).
-    const W = 820, H = 400, P = {t:30, r:100, b:88, l:56};
-    const pw = W - P.l - P.r, ph = H - P.t - P.b;
-    const stageMap = new Map();
+    const F = 'system-ui,-apple-system,sans-serif';
+    // Story points -> intended cycle time in days (the team's mapping); reference lines for 1/2/5/8.
+    const PT_DAYS = [[1, 0.25], [2, 1], [3, 2.5], [5, 5], [8, 10]], LINE_PTS = [1, 2, 5, 8];
+    const expDays = pts => {
+      if (pts == null || isNaN(pts)) return null;
+      if (pts <= 1) return 0.25;
+      for (let i = 0; i < PT_DAYS.length - 1; i++) {
+        const [p0, d0] = PT_DAYS[i], [p1, d1] = PT_DAYS[i + 1];
+        if (pts <= p1) return d0 + (d1 - d0) * (pts - p0) / (p1 - p0);
+      }
+      return 10 * pts / 8;
+    };
+    const fmtExp = dd => dd == null ? '?' : dd < 0.5 ? '~hrs' : dd === 1 ? '1d' : dd === 5 ? '1wk' : dd >= 10 ? 'sprint' : (Math.round(dd * 10) / 10) + 'd';
+    // Non-uniform duration scale: anchor the point-intent days at roughly even heights so the dense
+    // low-age region gets room and the sparse top collapses. Returns fraction 0 (bottom)..1 (top).
+    const ANCHORS = [[0, 0], [0.25, 0.14], [1, 0.40], [5, 0.70], [10, 0.90]];
+    const frac = age => {
+      if (age <= 0) return 0;
+      for (let i = 0; i < ANCHORS.length - 1; i++) {
+        const [a0, f0] = ANCHORS[i], [a1, f1] = ANCHORS[i + 1];
+        if (age <= a1) return f0 + (f1 - f0) * (age - a0) / (a1 - a0);
+      }
+      return Math.min(1, 0.90 + (age - 10) / 20);
+    };
+    // Per-row PR state, mirroring the Team-Status derivation so the chart and list agree.
+    const prState = r => {
+      if (!r.prSearched && looksLikeNoPr(r)) return { notNeeded: true };
+      if (r.prSearched) {
+        if (!r.prActivity) return (looksLikeNoPr(r) || r.aiNoPr) ? { notNeeded: true } : { missing: true };
+        const a = r.prActivity;
+        return { active: true, num: a.num, decision: a.reviewDecision || 'pending', lastAgo: a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '' };
+      }
+      return null;
+    };
+    const sevFor = (ptsNum, days, pr) => {
+      if (pr && pr.active && pr.decision === 'APPROVED') return { col: '#0a7a0a', glyph: '✓' };
+      const exp = expDays(ptsNum);
+      if (exp == null) return { col: '#94a3b8', glyph: '○' };
+      const ratio = days / exp;
+      if (ratio > 1.5) return { col: '#d03b3b', glyph: '⛔' };
+      if (ratio > 1.0) return { col: '#ec835a', glyph: '▲' };
+      if (ratio >= 0.75) return { col: '#fab219', glyph: '◆' };
+      return { col: '#0ca30c', glyph: '●' };
+    };
+    const noteFor = (ptsNum, days, pr, inReview) => {
+      if (inReview) {
+        if (pr && pr.active && pr.decision === 'APPROVED') return { txt: 'approved · held for deploy window', col: '#0a7a0a' };
+        if (pr && pr.active && pr.decision === 'CHANGES_REQUESTED') return { txt: 'changes requested', col: '#b91c1c' };
+        if (!pr || pr.missing || pr.notNeeded) return { txt: 'no PR linked', col: '#64748b' };
+        if (pr.active && pr.decision !== 'APPROVED') {
+          const stale = /month|week|\d{2,}\s?day/.test(pr.lastAgo || '');
+          return { txt: stale ? 'needs a reviewer · no activity ' + pr.lastAgo : 'awaiting a reviewer', col: '#b45309' };
+        }
+      }
+      const exp = expDays(ptsNum);
+      if (exp != null) {
+        const ratio = days / exp;
+        if (ratio > 1.0) return { txt: 'over its ' + fmtExp(exp) + ' intent', col: ratio > 1.5 ? '#d03b3b' : '#ec835a' };
+        if (ratio >= 0.75) return { txt: 'nearing ' + fmtExp(exp) + ' intent', col: '#b45309' };
+      }
+      return null;
+    };
+
+    // Group the in-flight rows by their board column, ordered by board position (left to right).
+    const colMap = new Map();
     for (const r of inFlightRows) {
-      if (!stageMap.has(r.status)) stageMap.set(r.status, []);
-      stageMap.get(r.status).push(r);
+      const cn = statusToColumn.get(r.status) || r.status;
+      if (!colMap.has(cn)) colMap.set(cn, { name: cn, idx: statusColumnIndex.get(r.status) ?? 99, cards: [], statuses: new Set() });
+      const o = colMap.get(cn);
+      o.cards.push(r); o.statuses.add(r.status);
+      o.idx = Math.min(o.idx, statusColumnIndex.get(r.status) ?? 99);
     }
-    const stages = [...stageMap.entries()]
-      .sort((a, b) => statusRank(b[0]) - statusRank(a[0]))
-      .map(([name, cards]) => ({ name, cards: [...cards].sort((a, b) => b.ms - a.ms) }));
-    const nc = stages.length, cw = pw / nc;
-    const maxDays = Math.max(...inFlightRows.map(r => Math.floor(r.ms / 86400000)), sleDays);
-    const yMax = Math.max(Math.ceil(maxDays * 1.3 / 5) * 5, 10);
-    const sy = d => ph * (1 - d / yMax);
+    const columns = [...colMap.values()].sort((a, b) => a.idx - b.idx);
+
+    // Canvas: full-width hero. Fonts sized for rendering near this width.
+    const W = 1120, H = 472, axisL = 40, rightLbl = 92;
+    const colTop = 46, colHdrH = 34, plotTop = colTop + colHdrH + 8, plotH = 336, plotBot = plotTop + plotH;
+    const plotLeft = axisL + 6, plotRight = W - rightLbl, colW = (plotRight - plotLeft) / columns.length;
+    const colX = i => plotLeft + i * colW;
+    const sy = age => plotBot - frac(age) * plotH;
     const e = [];
     e.push('<rect width="' + W + '" height="' + H + '" fill="#fff" rx="8" stroke="#e2e8f0"/>');
-    for (let i = 0; i < nc; i++) {
-      const x = (P.l + i * cw).toFixed(1);
-      e.push('<rect x="' + x + '" y="' + P.t + '" width="' + cw.toFixed(1) + '" height="' + ph + '" fill="' + (i % 2 ? '#fff' : '#f8fafc') + '"/>');
+
+    columns.forEach((col, i) => {
+      const x = colX(i);
+      e.push('<rect x="' + x.toFixed(1) + '" y="' + plotTop + '" width="' + colW.toFixed(1) + '" height="' + plotH + '" fill="' + (i % 2 ? '#fff' : '#f8fafc') + '"/>');
+      const n = columnCardCounts.get(col.name) ?? col.cards.length;
+      const max = columnLimits.get(col.name), min = columnMins.get(col.name);
+      const over = max != null && max > 0 && n > max, under = min != null && n < min;
+      e.push('<rect x="' + x.toFixed(1) + '" y="' + colTop + '" width="' + colW.toFixed(1) + '" height="' + colHdrH + '" fill="' + (over ? '#fdecec' : '#f1f5f9') + '" stroke="#e2e8f0"/>');
+      const subs = col.statuses.size > 1 ? ' <tspan font-size="11" font-weight="400" fill="#94a3b8">(' + _esc([...col.statuses].join(' + ')) + ')</tspan>' : '';
+      e.push('<text x="' + (x + 12).toFixed(1) + '" y="' + (colTop + 22) + '" font-family="' + F + '" font-size="15" font-weight="700" fill="#0f172a">' + _esc(col.name.toUpperCase()) + subs + '</text>');
+      const wip = (max != null && max > 0) ? (n + '/' + max + (over ? '  ⚠ over' : under ? '  · room to pull' : '')) : (n + ' · no cap');
+      e.push('<text x="' + (x + colW - 12).toFixed(1) + '" y="' + (colTop + 22) + '" text-anchor="end" font-family="' + F + '" font-size="13" font-weight="' + (over ? 700 : 500) + '" fill="' + (over ? '#b91c1c' : '#475569') + '">WIP ' + _esc(wip) + '</text>');
+    });
+    for (let i = 1; i < columns.length; i++) e.push('<line x1="' + colX(i).toFixed(1) + '" y1="' + plotTop + '" x2="' + colX(i).toFixed(1) + '" y2="' + plotBot + '" stroke="#e2e8f0"/>');
+
+    // Point-intent reference lines (replace the single SLE line and the linear age ticks).
+    for (const p of LINE_PTS) {
+      const y = sy(expDays(p));
+      e.push('<line x1="' + plotLeft + '" y1="' + y.toFixed(1) + '" x2="' + plotRight + '" y2="' + y.toFixed(1) + '" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3 4"/>');
+      e.push('<text x="' + (plotRight + 8) + '" y="' + (y + 4).toFixed(1) + '" font-family="' + F + '" font-size="12" font-weight="600" fill="#64748b">' + p + 'pt</text>');
+      e.push('<text x="' + (plotRight + 8) + '" y="' + (y + 18).toFixed(1) + '" font-family="' + F + '" font-size="10" fill="#94a3b8">' + fmtExp(expDays(p)) + '</text>');
     }
-    const tick = yMax <= 15 ? 2 : yMax <= 30 ? 5 : 10;
-    for (let d = 0; d <= yMax; d += tick) {
-      const y = (P.t + sy(d)).toFixed(1);
-      e.push('<line x1="' + P.l + '" y1="' + y + '" x2="' + (P.l+pw).toFixed(1) + '" y2="' + y + '" stroke="#f1f5f9" stroke-width="1"/>');
-      e.push('<text x="' + (P.l-8).toFixed(1) + '" y="' + y + '" text-anchor="end" dominant-baseline="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif">' + d + '</text>');
-    }
-    for (let i = 1; i < nc; i++) {
-      const x = (P.l + i * cw).toFixed(1);
-      e.push('<line x1="' + x + '" y1="' + P.t + '" x2="' + x + '" y2="' + (P.t+ph) + '" stroke="#e2e8f0" stroke-width="1"/>');
-    }
-    const sleY = (P.t + sy(sleDays)).toFixed(1);
-    e.push('<line x1="' + P.l + '" y1="' + sleY + '" x2="' + (P.l+pw).toFixed(1) + '" y2="' + sleY + '" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6 4"/>');
-    e.push('<text x="' + (P.l+pw+8).toFixed(1) + '" y="' + sleY + '" dominant-baseline="middle" fill="#d97706" font-size="16" font-weight="600" font-family="system-ui,sans-serif">SLE ' + sleDays + 'd</text>');
-    for (let i = 0; i < nc; i++) {
-      const cx = (P.l + i * cw + cw / 2).toFixed(1);
-      e.push('<text x="' + cx + '" y="' + (P.t+ph+26).toFixed(1) + '" text-anchor="middle" fill="#374151" font-size="17" font-weight="500" font-family="system-ui,sans-serif">' + _esc(stages[i].name) + '</text>');
-      const wipCol = statusToColumn.get(stages[i].name) ?? stages[i].name;
-      const wipLimit = columnLimits.get(wipCol);
-      // A hard-zero limit (e.g. In Review) is always "full" by design -- treat it like no
-      // limit at all here so the chart reports a plain count instead of a false alarm.
-      const hasLimit = wipLimit != null && wipLimit > 0;
-      const wipOver = hasLimit && (columnCardCounts.get(wipCol) ?? 0) > wipLimit;
-      const wipLabel = hasLimit ? 'WIP: ' + stages[i].cards.length + '/' + wipLimit : 'WIP: ' + stages[i].cards.length;
-      e.push('<text x="' + cx + '" y="' + (P.t+ph+48).toFixed(1) + '" text-anchor="middle" fill="' + (wipOver ? '#ef4444' : '#94a3b8') + '" font-size="15" font-weight="' + (wipOver ? '700' : '400') + '" font-family="system-ui,sans-serif">' + wipLabel + '</text>');
-    }
-    e.push('<line x1="' + P.l + '" y1="' + P.t + '" x2="' + P.l + '" y2="' + (P.t+ph) + '" stroke="#cbd5e1" stroke-width="1"/>');
-    e.push('<line x1="' + P.l + '" y1="' + (P.t+ph) + '" x2="' + (P.l+pw) + '" y2="' + (P.t+ph) + '" stroke="#cbd5e1" stroke-width="1"/>');
-    const midY = (P.t + ph / 2).toFixed(1);
-    e.push('<text x="18" y="' + midY + '" text-anchor="middle" fill="#94a3b8" font-size="16" font-family="system-ui,sans-serif" transform="rotate(-90 18 ' + midY + ')">Age (days)</text>');
-    for (let si = 0; si < nc; si++) {
-      const { cards } = stages[si];
-      const colCx = P.l + si * cw + cw / 2;
-      const spread = cards.length > 1 ? Math.min(cw * 0.5, (cards.length - 1) * 22) : 0;
-      for (let ci = 0; ci < cards.length; ci++) {
-        const r = cards[ci];
+    e.push('<text x="16" y="' + (plotTop + plotH / 2).toFixed(1) + '" text-anchor="middle" font-family="' + F + '" font-size="12" fill="#94a3b8" transform="rotate(-90 16 ' + (plotTop + plotH / 2).toFixed(1) + ')">time in status ↑ (lines = time a card of that size should take)</text>');
+
+    // Chips. Two-pass per-lane layout: anchor to age, push overlaps apart, shift to fit bounds.
+    const chipH = 58, gap = 8, lanePad = 12, laneGap = 10, minTop = plotTop + 6, maxTop = plotBot - chipH - 6;
+    const layoutLane = lc => {
+      const items = lc.map(c => ({ c, y: Math.min(Math.max(sy(Math.floor(c.ms / 86400000)) - chipH / 2, minTop), maxTop) })).sort((a, b) => a.y - b.y);
+      for (let i = 1; i < items.length; i++) if (items[i].y < items[i - 1].y + chipH + gap) items[i].y = items[i - 1].y + chipH + gap;
+      const of = items.length ? items[items.length - 1].y - maxTop : 0;
+      if (of > 0) for (const it of items) it.y = Math.max(minTop, it.y - of);
+      return items;
+    };
+    columns.forEach((col, ci) => {
+      const inReview = /review/i.test(col.name);
+      const sorted = [...col.cards].sort((a, b) => b.ms - a.ms);
+      const lanes = sorted.length <= 4 ? 1 : 2;
+      const innerW = colW - 2 * lanePad, chipW = lanes === 1 ? innerW : (innerW - laneGap) / 2;
+      const laneCards = Array.from({ length: lanes }, () => []);
+      sorted.forEach((c, i) => laneCards[i % lanes].push(c));
+      laneCards.forEach((lc, lane) => layoutLane(lc).forEach(({ c: r, y }) => {
         const days = Math.floor(r.ms / 86400000);
-        const lx = cards.length === 1 ? colCx : colCx + (ci / (cards.length - 1) - 0.5) * spread;
-        const cx = lx.toFixed(1), cy = (P.t + sy(days)).toFixed(1);
-        const pct = sleDays > 0 ? days / sleDays : 0;
-        const col = pct > 1.0 ? {f:'#ef4444',s:'#b91c1c'} : pct > 0.75 ? {f:'#f97316',s:'#ea580c'} : pct > 0.5 ? {f:'#eab308',s:'#ca8a04'} : {f:'#22c55e',s:'#16a34a'};
+        const ptsNum = typeof r.points === 'number' ? r.points : null;
+        const owner = (r.name || 'unassigned').split(' ')[0];
+        const info = issueStore[r.key] || {};
+        const title = info.title || r.summary || '';
+        const url = info.url || (BASE + '/browse/' + r.key);
+        const summary = info.summary || r.summary || '';
+        const pr = prState(r);
+        const s = sevFor(ptsNum, days, pr), note = noteFor(ptsNum, days, pr, inReview);
+        const exp = expDays(ptsNum);
+        const x = colX(ci) + lanePad + lane * (chipW + laneGap);
+        const dimmed = getActivePto(r.name) ? ' opacity="0.5"' : '';
+        const dashed = r.outOfSprint ? ' stroke-dasharray="4 3"' : '';
         const num = r.key.replace(/[^-]+-/, '');
-        const d = issueStore[r.key];
-        const url = d ? d.url : BASE + '/browse/' + r.key;
-        const cardTitle = d ? (r.key + ' — ' + d.title) : (r.key + ' — ' + trunc(r.summary, 60));
-        const cardSummary = d ? d.summary : (adfToText(r.descriptionText, 300) || r.summary);
-        e.push(
-          '<a href="' + url + '" target="_blank" style="text-decoration:none">' +
-          '<g class="wip-card" data-key="' + r.key + '" data-url="' + url + '" data-title="' + _esc(cardTitle) + '" data-summary="' + _esc(cardSummary) + '" data-name="' + _esc(r.name) + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
-          '<circle cx="' + cx + '" cy="' + cy + '" r="15" fill="' + col.f + '" stroke="' + col.s + '" stroke-width="1.5"/>' +
-          '<text x="' + cx + '" y="' + cy + '" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="13" font-weight="600" font-family="system-ui,sans-serif" style="pointer-events:none">' + num + '</text>' +
-          '</g></a>'
-        );
-      }
+        const titleRoom = Math.floor((chipW - 64) / 6.2);
+        const meta = owner + ' · ' + (ptsNum != null ? ptsNum + 'pt' : 'unpointed') + ' · ' + days + 'd' + (exp != null ? '/exp ' + fmtExp(exp) : '') + (col.statuses.size > 1 ? ' · ' + r.status : '');
+        e.push('<a href="' + _esc(url) + '" target="_blank" style="text-decoration:none">' +
+          '<g class="wip-card" data-key="' + _esc(r.key) + '" data-url="' + _esc(url) + '" data-title="' + _esc(r.key + ' — ' + title) + '" data-summary="' + _esc(summary) + '" data-name="' + _esc(r.name || '') + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
+          '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + chipW.toFixed(1) + '" height="' + chipH + '" rx="7" fill="#ffffff" stroke="#e2e8f0"' + dimmed + dashed + '/>' +
+          '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="4" height="' + chipH + '" rx="2" fill="' + s.col + '"/>' +
+          '<text x="' + (x + 12).toFixed(1) + '" y="' + (y + 19).toFixed(1) + '" font-family="' + F + '" font-size="13" font-weight="700" fill="' + s.col + '">' + s.glyph + '</text>' +
+          '<text x="' + (x + 28).toFixed(1) + '" y="' + (y + 19).toFixed(1) + '" font-family="' + F + '" font-size="12.5" font-weight="700" fill="#0f172a">' + _esc(num) + '</text>' +
+          '<text x="' + (x + 64).toFixed(1) + '" y="' + (y + 19).toFixed(1) + '" font-family="' + F + '" font-size="12.5" fill="#1f2937">' + _esc(trunc(title, titleRoom)) + '</text>' +
+          '<text x="' + (x + 12).toFixed(1) + '" y="' + (y + 37).toFixed(1) + '" font-family="' + F + '" font-size="11.5" fill="#475569">' + _esc(meta) + '</text>' +
+          (note ? '<text x="' + (x + 12).toFixed(1) + '" y="' + (y + 53).toFixed(1) + '" font-family="' + F + '" font-size="11" font-weight="600" fill="' + note.col + '">' + _esc(trunc(note.txt, Math.floor((chipW - 22) / 6.1))) + '</text>' : '') +
+          '</g></a>');
+      }));
+    });
+
+    // Legend
+    const ly = plotBot + 40;
+    let lx = axisL;
+    e.push('<text x="' + lx + '" y="' + ly + '" font-family="' + F + '" font-size="11" font-weight="600" fill="#475569">vs point-intent:</text>');
+    lx += 110;
+    for (const [g, c, t] of [['●', '#0ca30c', 'on track'], ['◆', '#fab219', 'approaching'], ['▲', '#ec835a', 'over'], ['⛔', '#d03b3b', 'well over'], ['✓', '#0a7a0a', 'approved']]) {
+      e.push('<text x="' + lx + '" y="' + ly + '" font-family="' + F + '" font-size="12" fill="' + c + '">' + g + '</text>');
+      e.push('<text x="' + (lx + 15) + '" y="' + ly + '" font-family="' + F + '" font-size="11" fill="#64748b">' + t + '</text>');
+      lx += 34 + t.length * 6.3;
     }
+    e.push('<text x="' + (W - 16) + '" y="' + ly + '" text-anchor="end" font-family="' + F + '" font-size="11" fill="#94a3b8">a card above its own size’s line is over intent · hover for detail, click to open</text>');
+
     return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;max-width:' + W + 'px;height:auto;display:block">\n' + e.join('\n') + '\n</svg>';
   }
 
-  // Sprint burndown: remaining story points per day (blue) against the ideal glide path (gray
-  // dashed). The actual line stops at today; the ideal runs the full sprint. Same 820x400 canvas
-  // as the aging-WIP chart so the two panels sit side by side cleanly.
+  // Sprint burndown: remaining story points per working day (blue) against the ideal glide path
+  // (gray dashed), on a working-day axis so it matches the sprint's "Day X of N". The actual line
+  // stops at today; the ideal runs the full sprint from the original commitment. When scope is pulled
+  // in mid-sprint, an amber step line shows the committed total rising. Full-width to match the
+  // aging-WIP board stacked above it.
   function generateBurndownSvg(metrics) {
     if (!metrics || !metrics.series.length) return '<p><em>Burndown unavailable (sprint dates or estimates missing).</em></p>';
     const series = metrics.series;
-    // Fonts are sized for this chart rendered at ~half page width (it shares a side-by-side row
-    // with the aging-WIP chart), so they stay legible after the SVG scales down.
-    const W = 820, H = 400, P = { t: 40, r: 30, b: 62, l: 62 };
+    const W = 1120, H = 360, P = { t: 40, r: 30, b: 62, l: 62 };
     const pw = W - P.l - P.r, ph = H - P.t - P.b;
     const nDays = series[series.length - 1].day;
     const yMax = Math.max(Math.ceil(metrics.committedPoints * 1.1 / 5) * 5, 5);
@@ -1401,6 +1551,16 @@ console.log = (...args) => { _origLog(...args); };
     }
     e.push('<line x1="' + P.l + '" y1="' + P.t + '" x2="' + P.l + '" y2="' + (P.t + ph) + '" stroke="#cbd5e1" stroke-width="1.5"/>');
     e.push('<line x1="' + P.l + '" y1="' + (P.t + ph) + '" x2="' + (P.l + pw) + '" y2="' + (P.t + ph) + '" stroke="#cbd5e1" stroke-width="1.5"/>');
+    // Scope line: total committed points over time, stepping up when cards are pulled in / created
+    // after the sprint started. Only drawn when scope actually grew, so a clean sprint stays clean.
+    if (metrics.addedPoints > 0) {
+      const scopePts = [];
+      for (let i = 0; i < series.length; i++) {
+        if (i > 0) scopePts.push(sx(series[i].day).toFixed(1) + ',' + sy(series[i - 1].committed).toFixed(1));
+        scopePts.push(sx(series[i].day).toFixed(1) + ',' + sy(series[i].committed).toFixed(1));
+      }
+      e.push('<polyline points="' + scopePts.join(' ') + '" fill="none" stroke="#f59e0b" stroke-width="2.5"/>');
+    }
     const idealPts = series.map(s => sx(s.day).toFixed(1) + ',' + sy(s.ideal).toFixed(1)).join(' ');
     e.push('<polyline points="' + idealPts + '" fill="none" stroke="#cbd5e1" stroke-width="2.5" stroke-dasharray="7 5"/>');
     const actual = series.filter(s => !s.future);
@@ -1413,12 +1573,18 @@ console.log = (...args) => { _origLog(...args); };
     }
     const midY = (P.t + ph / 2).toFixed(1);
     e.push('<text x="18" y="' + midY + '" text-anchor="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif" transform="rotate(-90 18 ' + midY + ')">Points remaining</text>');
-    e.push('<text x="' + (P.l + pw / 2).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif">Sprint day</text>');
-    e.push('<g font-family="system-ui,sans-serif" font-size="16">' +
+    e.push('<text x="' + (P.l + pw / 2).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif">Sprint day (working days)</text>');
+    let leg = '<g font-family="system-ui,sans-serif" font-size="16">' +
       '<line x1="' + (P.l + 10) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 40) + '" y2="' + (P.t - 12) + '" stroke="#3b82f6" stroke-width="3.5"/>' +
       '<text x="' + (P.l + 46) + '" y="' + (P.t - 7) + '" fill="#475569">Actual</text>' +
       '<line x1="' + (P.l + 120) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 150) + '" y2="' + (P.t - 12) + '" stroke="#cbd5e1" stroke-width="2.5" stroke-dasharray="7 5"/>' +
-      '<text x="' + (P.l + 156) + '" y="' + (P.t - 7) + '" fill="#475569">Ideal</text></g>');
+      '<text x="' + (P.l + 156) + '" y="' + (P.t - 7) + '" fill="#475569">Ideal</text>';
+    if (metrics.addedPoints > 0) {
+      leg += '<line x1="' + (P.l + 216) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 246) + '" y2="' + (P.t - 12) + '" stroke="#f59e0b" stroke-width="2.5"/>' +
+        '<text x="' + (P.l + 252) + '" y="' + (P.t - 7) + '" fill="#475569">Scope (+' + metrics.addedPoints + ' pt' + (metrics.addedPoints === 1 ? '' : 's') +
+        (metrics.addedCards ? ', ' + metrics.addedCards + ' card' + (metrics.addedCards === 1 ? '' : 's') : '') + ' pulled in)</text>';
+    }
+    e.push(leg + '</g>');
     return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;max-width:' + W + 'px;height:auto;display:block">\n' + e.join('\n') + '\n</svg>';
   }
 
@@ -1471,6 +1637,7 @@ console.log = (...args) => { _origLog(...args); };
         key: i.key,
         title: trunc(i.fields.summary, 70),
         status: i.fields.status?.name ?? '',
+        pointsLabel: pointsLabel(i.fields[STORY_POINTS_FIELD]),
         days,
         owner: i.fields.assignee?.displayName ?? null,
       });
@@ -1537,7 +1704,7 @@ console.log = (...args) => { _origLog(...args); };
               };
             }
           }
-          return { key: r.key, titleShort: trunc(r.summary, 70), status: r.status, days, over: days > sleDays, outOfSprint: r.outOfSprint === true, pr };
+          return { key: r.key, titleShort: trunc(r.summary, 70), status: r.status, pointsLabel: pointsLabel(r.points), days, over: days > sleDays, outOfSprint: r.outOfSprint === true, pr };
         }),
       };
     });
@@ -1549,7 +1716,7 @@ console.log = (...args) => { _origLog(...args); };
       return {
         name,
         pto: null,
-        suggestion: sug ? { key: sug.card.key, summary: trunc(sug.card.fields.summary, 50), basis: sug.basis || 'next in queue' } : null,
+        suggestion: sug ? { key: sug.card.key, summary: trunc(sug.card.fields.summary, 50), pointsLabel: pointsLabel(sug.card.fields[STORY_POINTS_FIELD]), basis: sug.basis || 'next in queue' } : null,
       };
     });
 
@@ -1624,9 +1791,13 @@ console.log = (...args) => { _origLog(...args); };
     return statusRank(aTop.status) - statusRank(bTop.status) || bTop.ms - aTop.ms;
   });
 
-  // Compute available engineers and backlog suggestions before output
+  // Compute available engineers and backlog suggestions before output. nonEngineers (from
+  // standup-context.json) are people who aren't picking up delivery work -- EMs, PMs, etc. They
+  // still appear in Team Status when they own a card, but are never listed as "available" or
+  // offered a backlog suggestion.
+  const nonEngineers = new Set(ctx.nonEngineers || []);
   const assignedNames = new Set(rows.map(r => r.name));
-  const available = [...team.keys()].filter(name => !assignedNames.has(name)).sort();
+  const available = [...team.keys()].filter(name => !assignedNames.has(name) && !nonEngineers.has(name)).sort();
 
   const engineerComponents = new Map();
   for (const issue of completed) {
@@ -1678,7 +1849,7 @@ console.log = (...args) => { _origLog(...args); };
     for (const r of cards) {
       const link = `[${r.key}](${BASE}/browse/${r.key})`;
       const sprintTag = r.outOfSprint ? ' · _not in sprint_' : '';
-      console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}${sprintTag}`);
+      console.log(`- ${link} ${trunc(r.summary, 60)} · ${pointsLabel(r.points)} · **${r.status}** · ${r.ct}${sprintTag}`);
       if (!r.prSearched && looksLikeNoPr(r)) {
         console.log(`  - no PR needed`);
       } else if (r.prSearched) {
@@ -1713,10 +1884,8 @@ console.log = (...args) => { _origLog(...args); };
     const suggestion = availSuggestions.get(name);
     if (suggestion) {
       const { card, basis } = suggestion;
-      const pts = card.fields[STORY_POINTS_FIELD];
-      const ptLabel = pts != null ? ` (${Math.round(pts)}pts)` : '';
       const basisLabel = basis ? `matched: ${basis}` : 'next in queue';
-      console.log(`**${name}** · available → [${card.key}](${BASE}/browse/${card.key}) ${trunc(card.fields.summary, 45)}${ptLabel} _(${basisLabel})_${upcomingSuffix}`);
+      console.log(`**${name}** · available → [${card.key}](${BASE}/browse/${card.key}) ${trunc(card.fields.summary, 45)} (${pointsLabel(card.fields[STORY_POINTS_FIELD])}) _(${basisLabel})_${upcomingSuffix}`);
     } else {
       console.log(`**${name}** · available _(${backlog.length ? 'backlog exhausted' : 'no unstarted unassigned sprint cards'})_${upcomingSuffix}`);
     }
@@ -1735,21 +1904,25 @@ console.log = (...args) => { _origLog(...args); };
     for (const i of visibleStragglers) {
       const days = Math.floor((NOW - new Date(i.fields.statuscategorychangedate).getTime()) / 86400000);
       const owner = i.fields.assignee?.displayName ?? 'unassigned';
-      console.log(`- [${i.key}](${BASE}/browse/${i.key}) — ${trunc(i.fields.summary, 70)} *(${i.fields.status?.name})* · ${days}d · ${owner} — consider adding to the sprint`);
+      console.log(`- [${i.key}](${BASE}/browse/${i.key}) — ${trunc(i.fields.summary, 70)} *(${i.fields.status?.name})* · ${pointsLabel(i.fields[STORY_POINTS_FIELD])} · ${days}d · ${owner} — consider adding to the sprint`);
     }
   }
 
   // ── Multi-Ticket Owners ─────────────────────────────────────────────────────
-  const multi = [...byAssignee.entries()].filter(([, cards]) => cards.length > 1).sort((a, b) => b[1].length - a[1].length);
+  // Only cards in an active (non-review) status count toward the "multiple tickets" flag: a card
+  // sitting in review is waiting on someone else, not competing for the owner's attention, so a dev
+  // with one in-review card plus one in-progress card is not carrying a divided-focus load.
+  const activeCardCount = cards => cards.filter(c => !/review/i.test(c.status)).length;
+  const multi = [...byAssignee.entries()].filter(([, cards]) => activeCardCount(cards) > 1).sort((a, b) => b[1].length - a[1].length);
 
   console.log('\n## Multi-Ticket Owners\n');
   if (!multi.length) {
-    console.log('No engineers currently assigned to more than one card.');
+    console.log('No engineers currently working more than one active (non-review) card.');
   } else {
     for (const [name, cards] of multi) {
       console.log(`**${name}** (${cards.length} cards)`);
       for (const r of cards) {
-        console.log(`- [${r.key}](${BASE}/browse/${r.key}) — ${trunc(r.summary, 70)} *(${r.status})*`);
+        console.log(`- [${r.key}](${BASE}/browse/${r.key}) — ${trunc(r.summary, 70)} *(${r.status})* · ${pointsLabel(r.points)}`);
       }
       console.log('');
     }
@@ -1771,7 +1944,7 @@ console.log = (...args) => { _origLog(...args); };
     for (const [name, cards] of [...byCollab.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       console.log(`**${name}** (${cards.length} card${cards.length !== 1 ? 's' : ''})`);
       for (const r of cards) {
-        console.log(`- [${r.key}](${BASE}/browse/${r.key}) — ${trunc(r.summary, 70)} *(${r.status})*`);
+        console.log(`- [${r.key}](${BASE}/browse/${r.key}) — ${trunc(r.summary, 70)} *(${r.status})* · ${pointsLabel(r.points)}`);
       }
       console.log('');
     }

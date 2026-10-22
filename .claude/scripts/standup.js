@@ -1141,6 +1141,13 @@ console.log = (...args) => { _origLog(...args); };
     }
     return null;
   }
+  // Was the card in some other sprint before it entered this one (carried over, or pulled forward
+  // from a later sprint)? Same rule /effort uses: such cards were planned work, not unplanned adds.
+  function hadPriorSprint(issue, enterMs) {
+    if (enterMs == null) return false;
+    return (issue.changelog?.histories || []).some(h => new Date(h.created).getTime() < enterMs &&
+      (h.items || []).some(it => it.field === 'Sprint' && typeof it.toString === 'string' && it.toString));
+  }
   function computeSprintMetrics() {
     if (!sprint) return null;
     const inScope = sprintIssues.filter(i => i.fields.status?.name !== 'Discard');
@@ -1150,7 +1157,7 @@ console.log = (...args) => { _origLog(...args); };
     const startMs = sprint.startDate ? new Date(sprint.startDate).getTime() : null;
     const endMs = sprint.endDate ? new Date(sprint.endDate).getTime() : null;
     const series = [];
-    let startScope = committedPoints, addedPoints = 0, addedCards = 0;
+    let startScope = committedPoints, addedPoints = 0, addedCards = 0, pulledPoints = 0, pulledCards = 0;
     if (startMs && endMs && endMs > startMs) {
       const startIso = isoFromMs(startMs), endIso = isoFromMs(endMs), EPS = 60000;
       // The burndown runs on working days only, so its axis matches the sprint's "Day X of N".
@@ -1165,16 +1172,21 @@ console.log = (...args) => { _origLog(...args); };
       };
       // Scope: cards present at sprint start vs pulled in / created after it started.
       startScope = 0;
-      const addEvents = [];
+      const addEvents = [], pulledEvents = [];
       for (const i of inScope) {
         const pts = pointsOf(i);
         const enterMs = sprintEnterMs(i);
         const createdMs = i.fields.created ? new Date(i.fields.created).getTime() : null;
         const atStart = enterMs != null ? enterMs <= startMs + EPS : (createdMs == null || createdMs <= startMs + EPS);
         if (atStart) startScope += pts;
-        else { addEvents.push({ pts, wd: Math.max(1, wdIndex(enterMs != null ? enterMs : createdMs)) }); addedCards++; }
+        else {
+          const ev = { pts, wd: Math.max(1, wdIndex(enterMs != null ? enterMs : createdMs)) };
+          if (hadPriorSprint(i, enterMs)) { pulledEvents.push(ev); pulledCards++; }
+          else { addEvents.push(ev); addedCards++; }
+        }
       }
       addedPoints = addEvents.reduce((s, e) => s + e.pts, 0);
+      pulledPoints = pulledEvents.reduce((s, e) => s + e.pts, 0);
       // Burn events: cards *currently* Done, by their first Done transition, mapped to a working day.
       const doneEvents = sprintDoneIssues
         .map(i => ({ pts: pointsOf(i), at: firstDoneMs(i) }))
@@ -1185,11 +1197,14 @@ console.log = (...args) => { _origLog(...args); };
       for (let k = 0; k <= totalWorking; k++) {
         const burned = doneEvents.reduce((s, e) => e.wd <= k ? s + e.pts : s, 0);
         const added = addEvents.reduce((s, e) => e.wd <= k ? s + e.pts : s, 0);
-        const committed = startScope + added;
+        const pulled = pulledEvents.reduce((s, e) => e.wd <= k ? s + e.pts : s, 0);
+        const planned = startScope + pulled; // planned work in the PI, including cards pulled forward
+        const committed = planned + added;
         series.push({
           day: k,
           ideal: Math.max(0, startScope * (1 - k / totalWorking)), // glide from the original commitment
           remaining: committed - burned,
+          planned,
           committed, // steps up as scope is pulled in mid-sprint
           future: k > elapsedWorking,
         });
@@ -1198,7 +1213,7 @@ console.log = (...args) => { _origLog(...args); };
     return {
       committedPoints, donePoints,
       totalCards: inScope.length, doneCards: sprintDoneIssues.length,
-      unpointed, startMs, endMs, series, startScope, addedPoints, addedCards,
+      unpointed, startMs, endMs, series, startScope, addedPoints, addedCards, pulledPoints, pulledCards,
     };
   }
   const sprintMetrics = computeSprintMetrics();
@@ -1526,7 +1541,7 @@ console.log = (...args) => { _origLog(...args); };
   // Sprint burndown: remaining story points per working day (blue) against the ideal glide path
   // (gray dashed), on a working-day axis so it matches the sprint's "Day X of N". The actual line
   // stops at today; the ideal runs the full sprint from the original commitment. When scope is pulled
-  // in mid-sprint, an amber step line shows the committed total rising. Full-width to match the
+  // in mid-sprint, a gray band stacks on the orange planned band, so the top edge is the committed total. Full-width to match the
   // aging-WIP board stacked above it.
   function generateBurndownSvg(metrics) {
     if (!metrics || !metrics.series.length) return '<p><em>Burndown unavailable (sprint dates or estimates missing).</em></p>';
@@ -1551,37 +1566,51 @@ console.log = (...args) => { _origLog(...args); };
     }
     e.push('<line x1="' + P.l + '" y1="' + P.t + '" x2="' + P.l + '" y2="' + (P.t + ph) + '" stroke="#cbd5e1" stroke-width="1.5"/>');
     e.push('<line x1="' + P.l + '" y1="' + (P.t + ph) + '" x2="' + (P.l + pw) + '" y2="' + (P.t + ph) + '" stroke="#cbd5e1" stroke-width="1.5"/>');
-    // Scope line: total committed points over time, stepping up when cards are pulled in / created
-    // after the sprint started. Only drawn when scope actually grew, so a clean sprint stays clean.
-    if (metrics.addedPoints > 0) {
-      const scopePts = [];
+    // Scope shading, stacked: orange = planned work (cards on the sprint at its start), gray = unplanned
+    // work pulled in or created after the start. The gray band rides on the orange one and steps up
+    // as cards arrive, so the top edge is the total committed scope. Gray is drawn only when scope grew.
+    const stepEdge = key => {
+      const pts = [];
       for (let i = 0; i < series.length; i++) {
-        if (i > 0) scopePts.push(sx(series[i].day).toFixed(1) + ',' + sy(series[i - 1].committed).toFixed(1));
-        scopePts.push(sx(series[i].day).toFixed(1) + ',' + sy(series[i].committed).toFixed(1));
+        if (i > 0) pts.push([sx(series[i].day), sy(key(series[i - 1]))]);
+        pts.push([sx(series[i].day), sy(key(series[i]))]);
       }
-      e.push('<polyline points="' + scopePts.join(' ') + '" fill="none" stroke="#f59e0b" stroke-width="2.5"/>');
+      return pts;
+    };
+    const fmt = pts => pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+    const baseY = sy(0), x0 = sx(series[0].day), x1 = sx(series[series.length - 1].day);
+    const plannedEdge = stepEdge(s => s.planned);
+    e.push('<polygon points="' + x0.toFixed(1) + ',' + baseY.toFixed(1) + ' ' + fmt(plannedEdge) + ' ' + x1.toFixed(1) + ',' + baseY.toFixed(1) + '" fill="#fdba74" fill-opacity="0.22"/>');
+    if (metrics.addedPoints > 0) {
+      const totalEdge = stepEdge(s => s.committed);
+      e.push('<polygon points="' + fmt(totalEdge) + ' ' + fmt(plannedEdge.slice().reverse()) + '" fill="#94a3b8" fill-opacity="0.2"/>');
     }
     const idealPts = series.map(s => sx(s.day).toFixed(1) + ',' + sy(s.ideal).toFixed(1)).join(' ');
-    e.push('<polyline points="' + idealPts + '" fill="none" stroke="#cbd5e1" stroke-width="2.5" stroke-dasharray="7 5"/>');
+    e.push('<polyline points="' + idealPts + '" fill="none" stroke="#94a3b8" stroke-width="2.5" stroke-dasharray="7 5"/>');
     const actual = series.filter(s => !s.future);
     if (actual.length) {
       const actualPts = actual.map(s => sx(s.day).toFixed(1) + ',' + sy(s.remaining).toFixed(1)).join(' ');
-      e.push('<polyline points="' + actualPts + '" fill="none" stroke="#3b82f6" stroke-width="3.5"/>');
+      e.push('<polyline points="' + actualPts + '" fill="none" stroke="#fff" stroke-width="8" stroke-linejoin="round" stroke-linecap="round"/>');
+      e.push('<polyline points="' + actualPts + '" fill="none" stroke="#1d4ed8" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round"/>');
       for (const s of actual) {
-        e.push('<circle cx="' + sx(s.day).toFixed(1) + '" cy="' + sy(s.remaining).toFixed(1) + '" r="6" fill="#3b82f6"/>');
+        e.push('<circle cx="' + sx(s.day).toFixed(1) + '" cy="' + sy(s.remaining).toFixed(1) + '" r="7" fill="#1d4ed8" stroke="#fff" stroke-width="2.5"/>');
       }
     }
     const midY = (P.t + ph / 2).toFixed(1);
     e.push('<text x="18" y="' + midY + '" text-anchor="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif" transform="rotate(-90 18 ' + midY + ')">Points remaining</text>');
     e.push('<text x="' + (P.l + pw / 2).toFixed(1) + '" y="' + (H - 10) + '" text-anchor="middle" fill="#94a3b8" font-size="17" font-family="system-ui,sans-serif">Sprint day (working days)</text>');
     let leg = '<g font-family="system-ui,sans-serif" font-size="16">' +
-      '<line x1="' + (P.l + 10) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 40) + '" y2="' + (P.t - 12) + '" stroke="#3b82f6" stroke-width="3.5"/>' +
+      '<line x1="' + (P.l + 10) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 40) + '" y2="' + (P.t - 12) + '" stroke="#1d4ed8" stroke-width="4.5"/>' +
       '<text x="' + (P.l + 46) + '" y="' + (P.t - 7) + '" fill="#475569">Actual</text>' +
-      '<line x1="' + (P.l + 120) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 150) + '" y2="' + (P.t - 12) + '" stroke="#cbd5e1" stroke-width="2.5" stroke-dasharray="7 5"/>' +
+      '<line x1="' + (P.l + 120) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 150) + '" y2="' + (P.t - 12) + '" stroke="#94a3b8" stroke-width="2.5" stroke-dasharray="7 5"/>' +
       '<text x="' + (P.l + 156) + '" y="' + (P.t - 7) + '" fill="#475569">Ideal</text>';
+    const planned = metrics.startScope + metrics.pulledPoints;
+    leg += '<rect x="' + (P.l + 216) + '" y="' + (P.t - 20) + '" width="18" height="14" fill="#fdba74" fill-opacity="0.45"/>' +
+      '<text x="' + (P.l + 240) + '" y="' + (P.t - 7) + '" fill="#475569">Planned (' + planned + ' pt' + (planned === 1 ? '' : 's') +
+      (metrics.pulledCards ? ', incl. ' + metrics.pulledCards + ' pulled forward' : '') + ')</text>';
     if (metrics.addedPoints > 0) {
-      leg += '<line x1="' + (P.l + 216) + '" y1="' + (P.t - 12) + '" x2="' + (P.l + 246) + '" y2="' + (P.t - 12) + '" stroke="#f59e0b" stroke-width="2.5"/>' +
-        '<text x="' + (P.l + 252) + '" y="' + (P.t - 7) + '" fill="#475569">Scope (+' + metrics.addedPoints + ' pt' + (metrics.addedPoints === 1 ? '' : 's') +
+      leg += '<rect x="' + (P.l + 500) + '" y="' + (P.t - 20) + '" width="18" height="14" fill="#94a3b8" fill-opacity="0.4"/>' +
+        '<text x="' + (P.l + 524) + '" y="' + (P.t - 7) + '" fill="#475569">Unplanned (+' + metrics.addedPoints + ' pt' + (metrics.addedPoints === 1 ? '' : 's') +
         (metrics.addedCards ? ', ' + metrics.addedCards + ' card' + (metrics.addedCards === 1 ? '' : 's') : '') + ' pulled in)</text>';
     }
     e.push(leg + '</g>');
